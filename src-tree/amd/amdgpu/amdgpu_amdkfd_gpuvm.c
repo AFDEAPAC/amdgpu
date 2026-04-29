@@ -1798,14 +1798,24 @@ void amdgpu_amdkfd_gpuvm_unpin_bo(struct amdgpu_bo *bo)
 	amdgpu_pin_info(adev,
 		"kfd_unpin enter: bo=%p size=%lluMB pin_count=%d\n",
 		bo, (u64)amdgpu_bo_size(bo) >> 20, bo->tbo.pin_count);
-	if (bo->tbo.pin_count == 0)
-		amdgpu_pin_warn(adev,
-			"kfd_unpin UNDERFLOW: bo=%p pin_count already 0\n",
-			bo);
 
 	ret = amdgpu_bo_reserve(bo, false);
 	if (unlikely(ret))
 		return;
+
+	/* V17.4 #4 P2: guard against double-unpin when the orphan reaper
+	 * has already force-unpinned this BO.  The reaper clears
+	 * rdma_quota_pin_count / rdma_quota_bytes / rdma_quota_charged
+	 * before we get here, so accounting is already correct.  Calling
+	 * amdgpu_bo_unpin() with pin_count==0 would WARN and wrap
+	 * rdma_quota_pin_count to UINT_MAX. */
+	if (bo->tbo.pin_count == 0) {
+		amdgpu_pin_warn(adev,
+			"kfd_unpin SKIP: bo=%p reaper already force-unpinned\n",
+			bo);
+		amdgpu_bo_unreserve(bo);
+		return;
+	}
 
 	/* Drain non-KFD fences (TTM moves, CS) before unpinning.
 	 * Mirrors the sync_wait in the pin path. */

@@ -314,11 +314,33 @@ static void amdgpu_kfd_reaper_fn(struct work_struct *work)
 				"amdgpu V15.5 #3 reap reserve failed bo=%p r=%d\n",
 				bo, r);
 		} else {
+			u64 reap_rdma_bytes = 0;
+
 			/* Strict drain first (#1 semantics): make sure no
 			 * fence references the pages before we decrement
 			 * pin_count. */
 			(void)amdgpu_kfd_unpin_drain(bo,
 				amdgpu_kfd_unpin_drain_ms);
+
+			/*
+			 * V17.4 #4 P0-prereq: take ownership of the RDMA
+			 * quota before force-unpinning so the cascading
+			 * amd_put_pages -> amdgpu_amdkfd_gpuvm_unpin_bo()
+			 * cannot double-decrement rdma_pinned_bytes.
+			 *
+			 * The unpin path keys off rdma_quota_charged; clear
+			 * it (and the per-BO count/bytes) so that path turns
+			 * into a no-op for accounting.  Use rdma_quota_bytes
+			 * (the authoritative charged value) rather than
+			 * op->bytes in case BO size changed.
+			 */
+			if (bo->kfd_bo && dmabuf_pin_max_mb &&
+			    bo->kfd_bo->rdma_quota_charged) {
+				reap_rdma_bytes = bo->kfd_bo->rdma_quota_bytes;
+				bo->kfd_bo->rdma_quota_pin_count = 0;
+				bo->kfd_bo->rdma_quota_bytes = 0;
+				bo->kfd_bo->rdma_quota_charged = false;
+			}
 
 			while (bo->tbo.pin_count > 0)
 				amdgpu_bo_unpin(bo);
@@ -327,8 +349,8 @@ static void amdgpu_kfd_reaper_fn(struct work_struct *work)
 			    bo->tbo.resource->mem_type == TTM_PL_VRAM) {
 				atomic64_sub((s64)amdgpu_bo_size(bo),
 					&adev->kfd.vram_pinned);
-				if (dmabuf_pin_max_mb)
-					amdgpu_kfd_rdma_quota_drop_saturated(adev, op->bytes, "orphan_reap");
+				if (dmabuf_pin_max_mb && reap_rdma_bytes)
+					amdgpu_kfd_rdma_quota_drop_saturated(adev, reap_rdma_bytes, "orphan_reap");
 			}
 
 			amdgpu_bo_unreserve(bo);

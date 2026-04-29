@@ -32,7 +32,13 @@
 #include "kfd_priv.h"
 #include "kfd_events.h"
 #include "kfd_device_queue_manager.h"
+#include "../amdgpu/amdgpu_reset.h"
 #include <linux/device.h>
+
+/* V17.4 #4 P0: bound the WaitRelaxed/INFINITE wait so a stuck GPU
+ * (no formal reset, no event signal) cannot pin a process forever. */
+#define KFD_EVENT_INFINITE_TIMEOUT_MS	30000
+#define KFD_EVENT_RESET_POLL_MS		2000
 
 /*
  * Wrapper around wait_queue_entry_t
@@ -1001,7 +1007,15 @@ int kfd_wait_on_events(struct kfd_process *p,
 
 	mutex_unlock(&p->event_mutex);
 
+	/* V17.4 #4 P0: anchor for the absolute deadline used by the
+	 * INFINITE-timeout path so a permanently stuck GPU returns
+	 * -ETIME instead of hanging the caller forever. */
+	const unsigned long wait_start = jiffies;
+
 	while (true) {
+		uint32_t k;
+		long sleep_jiffies;
+
 		if (fatal_signal_pending(current)) {
 			ret = -EINTR;
 			break;
@@ -1035,7 +1049,44 @@ int kfd_wait_on_events(struct kfd_process *p,
 		if (timeout <= 0)
 			break;
 
-		timeout = schedule_timeout(timeout);
+		/* V17.4 #4 P0: cap each sleep so we periodically re-check
+		 * GPU reset state.  RDMA-only processes are skipped by
+		 * kfd_signal_reset_event() (no compute queues -> no
+		 * has_reset_queue), so without this cap the INFINITE path
+		 * sleeps forever waiting on an event that never fires.
+		 */
+		if (*user_timeout_ms == KFD_EVENT_TIMEOUT_INFINITE) {
+			schedule_timeout(msecs_to_jiffies(KFD_EVENT_RESET_POLL_MS));
+		} else {
+			sleep_jiffies = min_t(long, timeout,
+					      msecs_to_jiffies(KFD_EVENT_RESET_POLL_MS));
+			timeout -= sleep_jiffies - schedule_timeout(sleep_jiffies);
+		}
+
+		/* Return -ETIME if any attached GPU entered reset so ROCr
+		 * handles the error path instead of waiting forever. */
+		for (k = 0; k < p->n_pdds; k++) {
+			struct kfd_process_device *pdd_k = p->pdds[k];
+
+			if (pdd_k && pdd_k->dev && pdd_k->dev->adev &&
+			    amdgpu_reset_pending(pdd_k->dev->adev->reset_domain)) {
+				ret = -ETIME;
+				break;
+			}
+		}
+
+		/* Absolute timeout for INFINITE waits: catches GPU stuck
+		 * at 100% without triggering a formal reset
+		 * (amdgpu_reset_pending stays false).  ROCr will check GPU
+		 * health and retry / recover. */
+		if (ret != -ETIME &&
+		    *user_timeout_ms == KFD_EVENT_TIMEOUT_INFINITE &&
+		    time_after(jiffies, wait_start +
+				       msecs_to_jiffies(KFD_EVENT_INFINITE_TIMEOUT_MS)))
+			ret = -ETIME;
+
+		if (ret == -ETIME)
+			break;
 	}
 	__set_current_state(TASK_RUNNING);
 
@@ -1286,7 +1337,12 @@ void kfd_signal_reset_event(struct kfd_node *dev)
 			continue;
 		}
 
-		if (dev->dqm->detect_hang_count && !pdd->has_reset_queue)
+		/* V17.4 #4 P0: signal queue-less processes (e.g. RDMA-only)
+		 * even in detect-hang mode -- they have no compute queues
+		 * so has_reset_queue can never be set, but a GPU hang still
+		 * blocks their peer-direct transfers. */
+		if (dev->dqm->detect_hang_count && !pdd->has_reset_queue &&
+		    pdd->qpd.queue_count > 0)
 			continue;
 
 		if (dev->dqm->detect_hang_count) {
