@@ -1,0 +1,234 @@
+From fd4e1305b909b5f3b50344906113cd1f3ddcde0c Mon Sep 17 00:00:00 2001
+From: chun-wan <chun-wan@amd.com>
+Date: Thu, 30 Apr 2026 00:28:49 +0800
+Subject: [PATCH] V17.4.1 amdgpu/kfd: fix RDMA hang -- rdma_pinned_bytes
+ underflow, WaitRelaxed infinite hang, and orphan-reaper double-unpin
+
+Bundles three fixes for the RDMA peer-direct hang scenario observed in
+muxing_dmesg_260429.log: RDMA packets arrive, GPU utilization reaches
+100%, and the process hangs permanently.
+
+Fix 1 (P0-prereq) src-tree/amd/amdgpu/amdgpu_kfd_rdma_v155.c
+  Orphan reaper now takes ownership of the RDMA quota by saving and
+  clearing rdma_quota_pin_count / rdma_quota_bytes / rdma_quota_charged
+  before force-unpinning.  amdgpu_amdkfd_gpuvm_unpin_bo() in the
+  cascading amd_put_pages path then sees rdma_quota_charged == false
+  and skips its decrement, preventing the double-decrement / underflow
+  to ~2^64 MB that would permanently block all future RDMA pins.
+  Uses rdma_quota_bytes (the authoritative charged value) rather than
+  op->bytes for the saturating drop.
+
+Fix 2 (P2) src-tree/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+  amdgpu_amdkfd_gpuvm_unpin_bo() now early-returns under the BO lock
+  if pin_count == 0, replacing the racy pre-reserve UNDERFLOW WARN.
+  This prevents amdgpu_bo_unpin() from WARN_ON(pin_count==0) and from
+  decrementing rdma_quota_pin_count from 0 to UINT_MAX.
+
+Fix 3 (P0) src-tree/amd/amdkfd/kfd_events.c
+  3a) kfd_signal_reset_event() no longer skips queue-less processes
+      (RDMA-only with qpd.queue_count == 0): they cannot have
+      has_reset_queue set yet a GPU hang still blocks their
+      peer-direct transfers.
+  3b) kfd_wait_on_events() caps each schedule_timeout to
+      KFD_EVENT_RESET_POLL_MS = 2 s and re-checks
+      amdgpu_reset_pending() across all attached GPUs.  Returns
+      -ETIME on reset.
+  3c) For INFINITE waits, an absolute wall-clock deadline of
+      KFD_EVENT_INFINITE_TIMEOUT_MS = 30 s catches GPUs stuck at 100%
+      without triggering a formal reset (amdgpu_reset_pending stays
+      false).  ROCr can then check health and retry/recover.
+
+Affected version: v17_3_no_guard (amdgpu 6.14.14-2212064.el8).
+DKMS rebuild required:
+  dkms build  amdgpu/6.14.14-2212064.el8.v17_3_no_guard
+  dkms install amdgpu/6.14.14-2212064.el8.v17_3_no_guard
+
+Signed-off-by: chun-wan <chun-wan@amd.com>
+---
+ src-tree/amd/amdgpu/amdgpu_amdkfd_gpuvm.c  | 18 +++++--
+ src-tree/amd/amdgpu/amdgpu_kfd_rdma_v155.c | 26 +++++++++-
+ src-tree/amd/amdkfd/kfd_events.c           | 60 +++++++++++++++++++++-
+ 3 files changed, 96 insertions(+), 8 deletions(-)
+
+diff --git a/src-tree/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/src-tree/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index cc24d72..56ace4a 100644
+--- a/src-tree/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/src-tree/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1798,15 +1798,25 @@ void amdgpu_amdkfd_gpuvm_unpin_bo(struct amdgpu_bo *bo)
+ 	amdgpu_pin_info(adev,
+ 		"kfd_unpin enter: bo=%p size=%lluMB pin_count=%d\n",
+ 		bo, (u64)amdgpu_bo_size(bo) >> 20, bo->tbo.pin_count);
+-	if (bo->tbo.pin_count == 0)
+-		amdgpu_pin_warn(adev,
+-			"kfd_unpin UNDERFLOW: bo=%p pin_count already 0\n",
+-			bo);
+ 
+ 	ret = amdgpu_bo_reserve(bo, false);
+ 	if (unlikely(ret))
+ 		return;
+ 
++	/* V17.4 #4 P2: guard against double-unpin when the orphan reaper
++	 * has already force-unpinned this BO.  The reaper clears
++	 * rdma_quota_pin_count / rdma_quota_bytes / rdma_quota_charged
++	 * before we get here, so accounting is already correct.  Calling
++	 * amdgpu_bo_unpin() with pin_count==0 would WARN and wrap
++	 * rdma_quota_pin_count to UINT_MAX. */
++	if (bo->tbo.pin_count == 0) {
++		amdgpu_pin_warn(adev,
++			"kfd_unpin SKIP: bo=%p reaper already force-unpinned\n",
++			bo);
++		amdgpu_bo_unreserve(bo);
++		return;
++	}
++
+ 	/* Drain non-KFD fences (TTM moves, CS) before unpinning.
+ 	 * Mirrors the sync_wait in the pin path. */
+ 	amdgpu_bo_sync_wait(bo, AMDGPU_FENCE_OWNER_KFD, false);
+diff --git a/src-tree/amd/amdgpu/amdgpu_kfd_rdma_v155.c b/src-tree/amd/amdgpu/amdgpu_kfd_rdma_v155.c
+index a49b44f..89004e4 100644
+--- a/src-tree/amd/amdgpu/amdgpu_kfd_rdma_v155.c
++++ b/src-tree/amd/amdgpu/amdgpu_kfd_rdma_v155.c
+@@ -314,12 +314,34 @@ static void amdgpu_kfd_reaper_fn(struct work_struct *work)
+ 				"amdgpu V15.5 #3 reap reserve failed bo=%p r=%d\n",
+ 				bo, r);
+ 		} else {
++			u64 reap_rdma_bytes = 0;
++
+ 			/* Strict drain first (#1 semantics): make sure no
+ 			 * fence references the pages before we decrement
+ 			 * pin_count. */
+ 			(void)amdgpu_kfd_unpin_drain(bo,
+ 				amdgpu_kfd_unpin_drain_ms);
+ 
++			/*
++			 * V17.4 #4 P0-prereq: take ownership of the RDMA
++			 * quota before force-unpinning so the cascading
++			 * amd_put_pages -> amdgpu_amdkfd_gpuvm_unpin_bo()
++			 * cannot double-decrement rdma_pinned_bytes.
++			 *
++			 * The unpin path keys off rdma_quota_charged; clear
++			 * it (and the per-BO count/bytes) so that path turns
++			 * into a no-op for accounting.  Use rdma_quota_bytes
++			 * (the authoritative charged value) rather than
++			 * op->bytes in case BO size changed.
++			 */
++			if (bo->kfd_bo && dmabuf_pin_max_mb &&
++			    bo->kfd_bo->rdma_quota_charged) {
++				reap_rdma_bytes = bo->kfd_bo->rdma_quota_bytes;
++				bo->kfd_bo->rdma_quota_pin_count = 0;
++				bo->kfd_bo->rdma_quota_bytes = 0;
++				bo->kfd_bo->rdma_quota_charged = false;
++			}
++
+ 			while (bo->tbo.pin_count > 0)
+ 				amdgpu_bo_unpin(bo);
+ 
+@@ -327,8 +349,8 @@ static void amdgpu_kfd_reaper_fn(struct work_struct *work)
+ 			    bo->tbo.resource->mem_type == TTM_PL_VRAM) {
+ 				atomic64_sub((s64)amdgpu_bo_size(bo),
+ 					&adev->kfd.vram_pinned);
+-				if (dmabuf_pin_max_mb)
+-					amdgpu_kfd_rdma_quota_drop_saturated(adev, op->bytes, "orphan_reap");
++				if (dmabuf_pin_max_mb && reap_rdma_bytes)
++					amdgpu_kfd_rdma_quota_drop_saturated(adev, reap_rdma_bytes, "orphan_reap");
+ 			}
+ 
+ 			amdgpu_bo_unreserve(bo);
+diff --git a/src-tree/amd/amdkfd/kfd_events.c b/src-tree/amd/amdkfd/kfd_events.c
+index f3a383b..e8ff2b8 100644
+--- a/src-tree/amd/amdkfd/kfd_events.c
++++ b/src-tree/amd/amdkfd/kfd_events.c
+@@ -32,8 +32,14 @@
+ #include "kfd_priv.h"
+ #include "kfd_events.h"
+ #include "kfd_device_queue_manager.h"
++#include "../amdgpu/amdgpu_reset.h"
+ #include <linux/device.h>
+ 
++/* V17.4 #4 P0: bound the WaitRelaxed/INFINITE wait so a stuck GPU
++ * (no formal reset, no event signal) cannot pin a process forever. */
++#define KFD_EVENT_INFINITE_TIMEOUT_MS	30000
++#define KFD_EVENT_RESET_POLL_MS		2000
++
+ /*
+  * Wrapper around wait_queue_entry_t
+  */
+@@ -1001,7 +1007,15 @@ int kfd_wait_on_events(struct kfd_process *p,
+ 
+ 	mutex_unlock(&p->event_mutex);
+ 
++	/* V17.4 #4 P0: anchor for the absolute deadline used by the
++	 * INFINITE-timeout path so a permanently stuck GPU returns
++	 * -ETIME instead of hanging the caller forever. */
++	const unsigned long wait_start = jiffies;
++
+ 	while (true) {
++		uint32_t k;
++		long sleep_jiffies;
++
+ 		if (fatal_signal_pending(current)) {
+ 			ret = -EINTR;
+ 			break;
+@@ -1035,7 +1049,44 @@ int kfd_wait_on_events(struct kfd_process *p,
+ 		if (timeout <= 0)
+ 			break;
+ 
+-		timeout = schedule_timeout(timeout);
++		/* V17.4 #4 P0: cap each sleep so we periodically re-check
++		 * GPU reset state.  RDMA-only processes are skipped by
++		 * kfd_signal_reset_event() (no compute queues -> no
++		 * has_reset_queue), so without this cap the INFINITE path
++		 * sleeps forever waiting on an event that never fires.
++		 */
++		if (*user_timeout_ms == KFD_EVENT_TIMEOUT_INFINITE) {
++			schedule_timeout(msecs_to_jiffies(KFD_EVENT_RESET_POLL_MS));
++		} else {
++			sleep_jiffies = min_t(long, timeout,
++					      msecs_to_jiffies(KFD_EVENT_RESET_POLL_MS));
++			timeout -= sleep_jiffies - schedule_timeout(sleep_jiffies);
++		}
++
++		/* Return -ETIME if any attached GPU entered reset so ROCr
++		 * handles the error path instead of waiting forever. */
++		for (k = 0; k < p->n_pdds; k++) {
++			struct kfd_process_device *pdd_k = p->pdds[k];
++
++			if (pdd_k && pdd_k->dev && pdd_k->dev->adev &&
++			    amdgpu_reset_pending(pdd_k->dev->adev->reset_domain)) {
++				ret = -ETIME;
++				break;
++			}
++		}
++
++		/* Absolute timeout for INFINITE waits: catches GPU stuck
++		 * at 100% without triggering a formal reset
++		 * (amdgpu_reset_pending stays false).  ROCr will check GPU
++		 * health and retry / recover. */
++		if (ret != -ETIME &&
++		    *user_timeout_ms == KFD_EVENT_TIMEOUT_INFINITE &&
++		    time_after(jiffies, wait_start +
++				       msecs_to_jiffies(KFD_EVENT_INFINITE_TIMEOUT_MS)))
++			ret = -ETIME;
++
++		if (ret == -ETIME)
++			break;
+ 	}
+ 	__set_current_state(TASK_RUNNING);
+ 
+@@ -1286,7 +1337,12 @@ void kfd_signal_reset_event(struct kfd_node *dev)
+ 			continue;
+ 		}
+ 
+-		if (dev->dqm->detect_hang_count && !pdd->has_reset_queue)
++		/* V17.4 #4 P0: signal queue-less processes (e.g. RDMA-only)
++		 * even in detect-hang mode -- they have no compute queues
++		 * so has_reset_queue can never be set, but a GPU hang still
++		 * blocks their peer-direct transfers. */
++		if (dev->dqm->detect_hang_count && !pdd->has_reset_queue &&
++		    pdd->qpd.queue_count > 0)
+ 			continue;
+ 
+ 		if (dev->dqm->detect_hang_count) {
+-- 
+2.43.5
+
