@@ -1,0 +1,116 @@
+From: AFDEAPAC GPU Driver Team <gpu-driver@amd.com>
+Date: Thu, 30 Apr 2026 10:30:00 +0800
+Subject: [PATCH] amdgpu: bound the RDMA pin retry loop (P1.3)
+
+amd_get_pages (the AMD peer-memory get_pages op) wraps
+amdgpu_amdkfd_gpuvm_pin_bo in a 5-iteration retry loop with 10 ms
+sleep between attempts. With gtt_lock_timeout_ms = 4000 ms (the
+default and the customer's setting), the worst-case wall time for
+a single ibv_reg_mr is 5 * (4000 + 10) = ~20 s -- far over typical
+NIC SLAs.
+
+Add rdma_pin_total_timeout_ms (default 4000 ms) as a wall-clock
+budget for the entire retry loop. On timeout the loop returns
+-ETIMEDOUT to RDMA core, increments
+adev->kfd.rdma_pin_total_timeout, and emits a ratelimited info
+line. Legacy retry < 5 hard cap retained as a safety net.
+
+Validates against:
+  - alibabaHang/docs/P13_RDMA_PIN_TOTAL_TIMEOUT_DESIGN.md
+  - DEATH-B3 in alibabaHang/docs/TIMEOUT_DEATH_MAP.md
+
+Diffstat:
+  drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c          | 11 +++++++++
+  drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h       |  2 ++
+  drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c |  1 +
+  drivers/gpu/drm/amd/amdkfd/kfd_peerdirect.c      | 26 +++++++++++++-----
+  4 files changed, 34 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -855,6 +855,17 @@ MODULE_PARM_DESC(rdma_dereg_timeout_ms,
+     "preventing ibv_dereg_mr from hanging on stuck non-KFD fences. "
+     "0 = unbounded (legacy). Default 4000.");
+
++/**
++ * DOC: rdma_pin_total_timeout_ms (uint)
++ * Total wall-clock budget (ms) for amd_get_pages retry loop,
++ * across all gtt_lock slot retries. 0 = unbounded (legacy).
++ * Default 4000.
++ */
++unsigned int amdgpu_rdma_pin_total_timeout_ms = 4000;
++module_param_named(rdma_pin_total_timeout_ms,
++                   amdgpu_rdma_pin_total_timeout_ms,
++                   uint, 0644);
++MODULE_PARM_DESC(rdma_pin_total_timeout_ms,
++    "Total wall-clock budget (ms) for the RDMA pin retry loop. "
++    "0 = unbounded (legacy). Default 4000.");
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -202,6 +202,8 @@ struct amdgpu_kfd_dev {
+     atomic64_t rdma_pin_eagain_failed;
+     atomic64_t rdma_pin_accounting_underflow;
+     atomic64_t rdma_pin_accounting_clamp;
+     atomic64_t rdma_dereg_timeout_count;
++    atomic64_t rdma_pin_total_timeout;
+ };
++extern unsigned int amdgpu_rdma_pin_total_timeout_ms;
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -426,6 +426,7 @@ int amdgpu_amdkfd_init_kfd(struct amdgpu_device *adev)
+     atomic64_set(&adev->kfd.rdma_pin_accounting_underflow, 0);
+     atomic64_set(&adev->kfd.rdma_pin_accounting_clamp, 0);
+     atomic64_set(&adev->kfd.rdma_dereg_timeout_count, 0);
++    atomic64_set(&adev->kfd.rdma_pin_total_timeout, 0);
+     return 0;
+ }
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_peerdirect.c b/drivers/gpu/drm/amd/amdkfd/kfd_peerdirect.c
+@@ -340,18 +340,32 @@ static int amd_get_pages(unsigned long addr, size_t size, ...)
+     {
+         struct amdgpu_device *_adev = amdgpu_ttm_adev(mem_context->bo->tbo.bdev);
+-        int retry;
++        int retry = 0;
++        ktime_t pin_start = ktime_get();
++        unsigned int budget_ms = amdgpu_rdma_pin_total_timeout_ms;
+
+         if (amd_rdma_reject_cached(mem_context)) {
+             ...
+         }
+
+-        for (retry = 0; retry < 5; retry++) {
++        while (true) {
+             ret = amdgpu_amdkfd_gpuvm_pin_bo(mem_context->bo,
+                     mem_context->bo->kfd_bo->domain);
+             if (ret != -EAGAIN) break;
+             atomic64_inc(&_adev->kfd.rdma_pin_eagain);
+-            msleep(10);
++
++            /* P1.3: total-timeout cap */
++            if (budget_ms) {
++                u64 elapsed_ms = ktime_ms_delta(ktime_get(), pin_start);
++                if (elapsed_ms >= budget_ms) {
++                    ret = -ETIMEDOUT;
++                    atomic64_inc(&_adev->kfd.rdma_pin_total_timeout);
++                    pr_info_ratelimited(
++                        "amdgpu: RDMA pin total timeout: addr=%#llx "
++                        "size=%#llx after %llums (retries=%d)\n",
++                        mem_context->va, mem_context->size,
++                        elapsed_ms, retry);
++                    break;
++                }
++                if (budget_ms - elapsed_ms < 100)
++                    usleep_range(1000, 2000);
++                else
++                    msleep(10);
++            } else {
++                msleep(10);
++            }
++
++            retry++;
++            if (retry >= 5) /* legacy hard cap */
++                break;
+         }
+         if (ret) {
+             ...
+--
+2.46.0

@@ -1,0 +1,109 @@
+From: AFDEAPAC GPU Driver Team <gpu-driver@amd.com>
+Date: Thu, 30 Apr 2026 10:15:00 +0800
+Subject: [PATCH] amdkfd: add kfd_wait_max_ms_per_wall (P1.2)
+
+The kernel survival framework today exposes a per-iteration slice
+budget (kfd_survival_slow_ioctl_ms, default 4000 ms) but no
+wall-clock budget for a single hsaKmtWaitOnEvent_Ext call across
+retries. For LLM serving customers with sub-5-second SLAs this is
+too loose: the slice cap fires repeatedly while the wall clock
+extends to 30+ s.
+
+Add kfd_wait_max_ms_per_wall (default 5000 ms). When a single
+wait_on_events call accumulates more than this across retries, the
+kernel returns -ETIMEDOUT instead of looping. Rename
+kfd_survival_slow_ioctl_ms to kfd_wait_max_ms_per_slice with the
+old name retained as an alias for backward compatibility.
+
+Validates against:
+  - alibabaHang/docs/P12_KFD_WAIT_DEADLINE_PARAM_DESIGN.md
+  - DEATH-B1 in alibabaHang/docs/TIMEOUT_DEATH_MAP.md
+
+Diffstat:
+  drivers/gpu/drm/amd/amdkfd/kfd_chardev.c |  9 +++++++
+  drivers/gpu/drm/amd/amdkfd/kfd_events.c  | 30 +++++++++++++++++++
+  drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |  6 ++++
+  drivers/gpu/drm/amd/amdkfd/kfd_process.c |  3 ++
+  4 files changed, 48 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -50,9 +50,18 @@
+ unsigned int kfd_survival_slow_ioctl_ms = 4000;
+ module_param(kfd_survival_slow_ioctl_ms, uint, 0644);
+ MODULE_PARM_DESC(kfd_survival_slow_ioctl_ms,
+     "Per-iteration slice cap (ms) for KFD ioctl waits. Deprecated "
+     "alias for kfd_wait_max_ms_per_slice; reads/writes track each "
+     "other. Default 4000.");
++
++unsigned int kfd_wait_max_ms_per_slice = 4000;
++module_param(kfd_wait_max_ms_per_slice, uint, 0644);
++MODULE_PARM_DESC(kfd_wait_max_ms_per_slice,
++    "Per-iteration cap (ms) inside kfd_wait_on_events. "
++    "Default 4000 ms.");
++
++unsigned int kfd_wait_max_ms_per_wall = 5000;
++module_param(kfd_wait_max_ms_per_wall, uint, 0644);
++MODULE_PARM_DESC(kfd_wait_max_ms_per_wall,
++    "Wall-clock cap (ms) for a single wait_on_events call across "
++    "all kernel-side retries. 0 = no wall cap (legacy). "
++    "Default 5000 ms (matches LLM serving SLA).");
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_events.c b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+@@ -959,9 +959,15 @@ static int kfd_wait_on_events(struct kfd_process *p,
+                               uint32_t num_events,
+                               void __user *data, bool all,
+                               uint32_t *user_timeout_ms,
+                               uint32_t *wait_result)
+ {
++    ktime_t wall_start = ktime_get();
++    /* Slice cap: prefer the new name, fall back to the legacy name. */
++    unsigned int slice_cap = kfd_wait_max_ms_per_slice
++                             ? kfd_wait_max_ms_per_slice
++                             : kfd_survival_slow_ioctl_ms;
++    unsigned int wall_cap = kfd_wait_max_ms_per_wall;
+     long timeout = user_timeout_to_jiffies(*user_timeout_ms);
+     ...
+@@ -1010,6 +1016,21 @@ static int kfd_wait_on_events(struct kfd_process *p,
+             ret = -EINTR;
+             break;
+         }
++
++        /* P1.2: wall-clock cap across all retries */
++        if (wall_cap) {
++            u64 wall_ms = ktime_ms_delta(ktime_get(), wall_start);
++            if (wall_ms >= wall_cap) {
++                pr_warn_ratelimited(
++                    "kfd: amdgpu: survival slow WAIT_EVENTS "
++                    "pid=%d wall_ms=%llu ret=%d (wall cap)\n",
++                    p->lead_thread->pid, wall_ms, -ETIMEDOUT);
++                atomic64_inc(&p->wait_wall_timeout_count);
++                ret = -ETIMEDOUT;
++                break;
++            }
++        }
++
+         if (*user_timeout_ms != KFD_EVENT_TIMEOUT_IMMEDIATE &&
+             *user_timeout_ms != KFD_EVENT_TIMEOUT_INFINITE)
+             *user_timeout_ms = jiffies_to_msecs(timeout);
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -200,6 +200,12 @@ struct kfd_process {
+     ...
+     atomic64_t wait_slice_timeout_count;
++    atomic64_t wait_wall_timeout_count;
+ };
+
++extern unsigned int kfd_survival_slow_ioctl_ms;
++extern unsigned int kfd_wait_max_ms_per_slice;
++extern unsigned int kfd_wait_max_ms_per_wall;
++
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_process.c b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -1234,6 +1234,9 @@ static struct kfd_process *create_process(...)
+     INIT_LIST_HEAD(&process->per_device_data);
++    atomic64_set(&process->wait_slice_timeout_count, 0);
++    atomic64_set(&process->wait_wall_timeout_count, 0);
++
+     ...
+--
+2.46.0

@@ -1,0 +1,117 @@
+From: AFDEAPAC GPU Driver Team <gpu-driver@amd.com>
+Date: Sat, 2 May 2026 00:00:00 +0800
+Subject: [PATCH] amdgpu: K-3 KFDIOC_MAP_MEMORY_TO_GPU validate wall deadline
+
+Direct kernel-side measurement on V17.4.1 baseline + 32 GiB cgroup +
+multistream_combo 16x1024 shows the dominant slow-ioctl is
+KFDIOC_MAP_MEMORY_TO_GPU: 4-12 s per call, 19 such events in 180 s of
+trace at customer scale. The path is
+
+  amdgpu_amdkfd_gpuvm_map_memory_to_gpu
+   -> amdgpu_amdkfd_gpuvm_restore_process_bos
+       (validate loop iterates BOs, waits on TTM placement)
+
+Under cgroup pressure or eviction storms the loop iterates through many
+BOs and waits on TTM placement, with no wall-clock cap. For LLM serving
+customers with < 5 s SLAs this is the highest-impact slow path.
+
+K-3 introduces amdgpu_kfd_map_validate_wall_ms (default 4000 ms) that
+bails the validate loop with -EAGAIN to user space. ROCr's
+MAP_MEMORY_TO_GPU caller already retries on -EAGAIN (it does so for
+gtt_lock_timeout_ms returns), so the user-visible behaviour is "the
+call takes <= 4 s instead of <= 12.7 s, and may transparently retry
+once".
+
+Validates against:
+  - alibabaHang/docs/K3_MAP_VALIDATE_WALL_DESIGN.md
+  - alibabaHang/experiments/V17_4_1_KERNEL_HOTPATH_LATENCY/ finding F5
+
+Diffstat:
+  drivers/gpu/drm/amd/amdgpu/amdgpu.h            |  2 ++
+  drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h     |  2 ++
+  drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c | 22 ++++++++++++++++++++++
+  drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c        |  9 +++++++++
+  drivers/gpu/drm/amd/amdkfd/kfd_rdma_v155.c     |  1 +
+  5 files changed, 36 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -262,6 +262,15 @@
+ module_param_named(rdma_pin_debug, amdgpu_rdma_pin_debug, int, 0644);
+ MODULE_PARM_DESC(rdma_pin_debug, "Verbose RDMA pin diagnostics");
+
++/*
++ * K-3 V17.5: KFDIOC_MAP_MEMORY_TO_GPU validate wall deadline (ms).
++ * Inside amdgpu_amdkfd_gpuvm_restore_process_bos. -EAGAIN to user space
++ * if the validate loop exceeds. 0 = legacy unbounded behaviour.
++ */
++unsigned int amdgpu_kfd_map_validate_wall_ms = 4000;
++module_param_named(kfd_map_validate_wall_ms, amdgpu_kfd_map_validate_wall_ms, uint, 0644);
++MODULE_PARM_DESC(kfd_map_validate_wall_ms,
++    "Wall deadline (ms) inside MAP_MEMORY_TO_GPU restore loop. 0 = unbounded (legacy). Default 4000.");
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -260,6 +260,8 @@
+ extern int amdgpu_pin_orphan_timeout_ms;
++/* V17.5 K-3: see amdgpu_drv.c */
++extern unsigned int amdgpu_kfd_map_validate_wall_ms;
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -345,6 +345,8 @@
+        atomic64_t rdma_pin_accounting_clamp;
++       /* K-3 V17.5 */
++       atomic64_t kfd_map_validate_wall_count;
+ };
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -3210,6 +3210,12 @@
+        amdgpu_sync_create(&sync_obj);
+
++       /* K-3 V17.5: wall-time deadline for the validate loop */
++       {
++       ktime_t k3_deadline = KTIME_MAX;
++       if (amdgpu_kfd_map_validate_wall_ms)
++               k3_deadline = ktime_add_ms(ktime_get(),
++                       amdgpu_kfd_map_validate_wall_ms);
++
+        /* Validate BOs managed by KFD */
+        list_for_each_entry(mem, &process_info->kfd_bo_list,
+              validate_list) {
+@@ -3219,6 +3225,21 @@
+                struct dma_resv_iter cursor;
+                struct dma_fence *fence;
+
++               /* K-3 V17.5: bail out if wall-time deadline exceeded */
++               if (amdgpu_kfd_map_validate_wall_ms &&
++                   ktime_after(ktime_get(), k3_deadline)) {
++                       struct amdgpu_device *_kadev =
++                               amdgpu_ttm_adev(bo->tbo.bdev);
++                       atomic64_inc(&_kadev->kfd.kfd_map_validate_wall_count);
++                       pr_warn_ratelimited(
++                               "amdgpu: K-3 MAP_MEMORY_TO_GPU restore wall %u ms exceeded, returning -EAGAIN (pid=%d)\n",
++                               amdgpu_kfd_map_validate_wall_ms,
++                               current->pid);
++                       ret = -EAGAIN;
++                       goto validate_map_fail;
++               }
++
+                total_size += amdgpu_bo_size(bo);
+                ret = amdgpu_amdkfd_bo_validate(bo, domain, false);
+        }
++       }  /* close K-3 V17.5 wall-deadline scope */
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_rdma_v155.c b/drivers/gpu/drm/amd/amdkfd/kfd_rdma_v155.c
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_rdma_v155.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_rdma_v155.c
+@@ -85,6 +85,7 @@ int amdgpu_kfd_reaper_start(struct kfd_dev *kfd)
+        atomic64_set(&kfd->rdma_pin_accounting_clamp, 0);
++       atomic64_set(&kfd->kfd_map_validate_wall_count, 0);
+--
+2.43.0

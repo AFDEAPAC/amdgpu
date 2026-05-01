@@ -1,0 +1,115 @@
+From: ROCm runtime/driver team <gpu-driver@amd.com>
+Subject: [PATCH RFC v2.3] amdkfd: K-5 V2.3 lookup-at-uncharge to fix kfd_process kref leak
+
+Replace the kgd_mem.kfdp_owner kref-storage design from V2/V2.1/V2.2
+with a "lookup-at-uncharge" pattern: at charge time we still call
+kfd_lookup_process_by_mm() to get a kfd_process for the precheck, but
+we drop the ref immediately after marking the BO. At uncharge time
+(unpin / free / error rollback), we look up kfd_process again via
+current->mm. If the lookup fails (cross-mm uncharge: peer-memory
+reaper after process exit, dma-buf importer free, mmu_notifier
+release running in workqueue context with no current->mm) we leave
+the per-process counter stale rather than leak a kref.
+
+Motivation
+----------
+V2.1 and V2.2 both leaked kfd_process krefs when the customer
+workload exercised RDMA peer-memory reaper backlog. After ~14 minutes
+of soak, /sys/module/amdgpu/refcnt accumulated to ~65,500 (close to
+U16_MAX). Root cause: each charge took a kfd_process kref and stored
+it in kgd_mem.kfdp_owner; at uncharge the matching put runs only if
+the unpin path is reached normally. Reaper-driven unpin runs in a
+workqueue with no current task, can race with kfd_process_destroy(),
+and the orphaned BO holds the kref indefinitely. V2.2 added an
+explicit cleanup at err_reserve_limit but did not cover the reaper
+case, so the leak persisted.
+
+Tradeoff
+--------
+Cross-mm uncharge cannot find the original kfd_process and leaves
+its per-process pin counter stale. This is bounded and benign:
+
+  - The K-5 cap is recomputed from cgroup memcg on every charge, so
+    a stale counter only shrinks effective headroom for the SAME
+    process whose mm is dying. New processes get a fresh cap.
+  - kfd_process is destroyed via kfd_process_destroy()
+    (kfd_chardev release path), which also runs from the dying mm
+    and zeroes the counter when the kfd_process struct is freed.
+  - No global counter, no cgroup counter, no kernel module refcnt
+    sees this drift.
+
+Patch summary
+-------------
+Removed:
+  - kgd_mem.kfdp_owner field (was: void *, struct kfd_process *)
+
+Kept:
+  - kgd_mem.kfdp_charged_bytes (mirror of charged amount)
+  - kgd_mem.kfdp_host_charged (which counter to roll back to)
+
+Modified call sites in amdgpu_amdkfd_gpuvm.c (8 sites):
+  1. amdgpu_amdkfd_gpuvm_pin_bo:
+     a. RDMA charge (drop kref after charge)
+     b. RDMA charge rollback when rdma_quota_try_charge fails
+     c. pin_non_vram_rollback (out: target)
+     d. err_accounting (err_accounting: target)
+  2. amdgpu_amdkfd_gpuvm_unpin_bo:
+     e. RDMA unpin (was the worst leaker -- reaper path)
+  3. amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu:
+     f. host-pin charge (drop kref after charge)
+     g. reserve_mem_limit failure rollback
+     h. err_reserve_limit catch-all
+  4. amdgpu_amdkfd_gpuvm_free_memory_of_gpu:
+     i. top-of-function host-pin uncharge
+
+Tested on hjbog-srdc-22, MI308X, host 5.10.134, amdgpu 6.14.14:
+  - V2.2 baseline: refcnt grows to 65,527 in 14 minutes of mr_burn +
+    hip_host_burn churn.
+  - V2.3 (this patch): refcnt stable at 0..3 across same workload.
+  - K-5 cap enforcement: identical to V2.2 (regression matrix passes).
+
+Signed-off-by: ROCm runtime/driver team <gpu-driver@amd.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h        |  20 ++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c  | 110 +++++++++++++--------
+ 2 files changed, 80 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -105,15 +105,21 @@ struct kgd_mem {
+ 	bool rdma_quota_charged;
+ 
+ 	/*
+-	 * K-5 V2: per-process pin owner.
+-	 * Saved at first charge so the unpin path can decrement the right
+-	 * kfd_process even when called from a different mm (e.g. unpin
+-	 * triggered by process B for a BO charged by process A).
+-	 * Owner ref is taken via kfd_lookup_process_by_mm() at charge time;
+-	 * dropped via kfd_unref_process() at uncharge or destroy.
++	 * K-5 V2.3: per-process pin accounting (no owner ref).
++	 * kfdp_charged_bytes records how much we charged (so unpin/free
++	 * can roll back the same amount). kfdp_host_charged tells the
++	 * uncharge code whether the bytes are on the host_pin counter
++	 * (true: GTT/USERPTR/host) or rdma_pin counter (false: VRAM).
++	 *
++	 * Uncharge re-looks up kfd_process via current->mm at unpin/free
++	 * time. Cross-mm paths (peer-memory reaper after process exit,
++	 * dma-buf importer free, mmu_notifier release in workqueue) will
++	 * fail the lookup and leave the per-process counter stale; this
++	 * is acceptable because the K-5 cap is recomputed from cgroup
++	 * memcg on every charge, so a stale entry only shrinks effective
++	 * headroom for the (already dying) process. Storing a kref here
++	 * was the V2/V2.1 design but caused module refcnt leaks under
++	 * peer-memory reaper backlog -- removed in V2.3.
+ 	 */
+-	void *kfdp_owner;            /* struct kfd_process * */
+ 	u64   kfdp_charged_bytes;    /* mirror of how much we charged */
+ 	bool  kfdp_host_charged;     /* true if charged against host_pin counter */
+ };
+
+(*** see experiments/V17_5_K5_FEASIBILITY/build/v23_deploy_2026-05-01/v23_gpuvm.patch
+     for the full unified diff against amdgpu_amdkfd_gpuvm.c -- 7 KiB / 151 lines ***)
+
+-- 
+2.43.0

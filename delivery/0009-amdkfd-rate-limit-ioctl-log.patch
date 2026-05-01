@@ -1,0 +1,51 @@
+From 0de57cdc2fe05b818595646c7f850db169169884 Mon Sep 17 00:00:00 2001
+From: Yifan Zhang <yifan1.zhang@amd.com>
+Date: Thu, 30 Apr 2026 15:47:57 +0800
+Subject: [PATCH] drm/amdkfd: rate limit ioctl log
+
+Reroute the per-ioctl entry debug print through dev_dbg_ratelimited()
+so that workloads issuing very high-frequency KFD ioctls (queue
+manipulation, alloc/free, suballoc) cannot drown the kernel ring
+buffer when CONFIG_DYNAMIC_DEBUG flips this print on for triage.
+
+Background
+----------
+With dev_dbg() active, a single inference iteration can emit thousands
+of "ioctl cmd 0x... arg 0x..." lines per second. On hot reproducers
+(e.g. sdma_suballoc_hang spawning >8k threads each calling
+KFD_IOC_ALLOC_MEMORY_OF_GPU and KFD_IOC_FREE_MEMORY_OF_GPU back to
+back) this fully saturates dmesg and obscures the real failure mode.
+
+Switching to dev_dbg_ratelimited() preserves the diagnostic value of
+the print (first few entries per second still recorded) while
+preventing the loss of upstream/downstream messages around the actual
+hang or crash window. The exit-side dev_dbg() print at line ~3899 is
+kept as-is because it is gated by ret != 0 so it does not flood under
+normal operation.
+
+Tested on hjbog-srdc-22, MI308X, host kernel 5.10.134 + amdgpu DKMS
+6.14.14 (V17.5 K-5 V2.3 stack). Confirmed dmesg no longer drowns under
+sdma_suballoc_hang with -ECP=8192 -ETH=4 reproducer.
+
+Cherry-picked from amd-staging-drm-next sha 0de57cdc2fe0.
+
+Signed-off-by: Yifan Zhang <yifan1.zhang@amd.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+index c375a821c498..fd58085ac5df 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -3592,7 +3592,7 @@ static long kfd_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
+ 		goto err_i1;
+ 	}
+ 
+-	dev_dbg(kfd_device, "ioctl cmd 0x%x (#0x%x), arg 0x%lx\n", cmd, nr, arg);
++	dev_dbg_ratelimited(kfd_device, "ioctl cmd 0x%x (#0x%x), arg 0x%lx\n", cmd, nr, arg);
+ 
+ 	/* Get the process struct from the filep. Only the process
+ 	 * that opened /dev/kfd can use the file descriptor. Child
+-- 
+2.43.0
