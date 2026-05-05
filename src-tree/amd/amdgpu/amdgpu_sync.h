@@ -60,6 +60,8 @@ int amdgpu_sync_clone(struct amdgpu_sync *source, struct amdgpu_sync *clone);
 void amdgpu_sync_move(struct amdgpu_sync *src, struct amdgpu_sync *dst);
 int amdgpu_sync_push_to_job(struct amdgpu_sync *sync, struct amdgpu_job *job);
 int amdgpu_sync_wait(struct amdgpu_sync *sync, bool intr);
+long amdgpu_sync_wait_timeout(struct amdgpu_sync *sync, bool intr,
+			      unsigned long timeout);
 void amdgpu_sync_free(struct amdgpu_sync *sync);
 int amdgpu_sync_init(void);
 void amdgpu_sync_fini(void);
