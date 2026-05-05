@@ -141,6 +141,7 @@ struct amdgpu_kfd_dev {
 	atomic64_t rdma_pin_orphans_reaped;  /* total orphans force-unpinned */
 	atomic64_t free_wait_pinned_count;   /* #2: how many times free waited */
 	atomic64_t free_wait_pinned_timeout; /* #2: how many times wait timed out */
+	atomic64_t rdma_dereg_timeout_count; /* DEATH-A2: rdma_dereg fence wait timeouts */
 	struct delayed_work reaper_work;
 	bool reaper_started;
 
