@@ -954,21 +954,27 @@ MODULE_PARM_DESC(dmabuf_pin_critical_mb,
  * DOC: pin_orphan_timeout_ms (int) [V15.5 #3]
  * A BO that is freed by userspace while still RDMA-pinned is queued on an
  * orphan list. After this many milliseconds the reaper kthread force-unpins
- * it and releases the VRAM. Default 60000 (1 minute).
+ * it and releases the VRAM. Default 10000 (10 seconds).
+ * The previous default of 60000 (1 minute) left pinned VRAM unreclaimable
+ * for too long under cgroup memory pressure, aggravating TTM eviction
+ * cascades and SDMA suballoc stalls. rdma_dereg_timeout_ms=4000 ensures
+ * the RDMA unpin path completes within 4s, so 10s provides ample margin.
  */
-int amdgpu_pin_orphan_timeout_ms = 60000;
+int amdgpu_pin_orphan_timeout_ms = 10000;
 module_param_named(pin_orphan_timeout_ms, amdgpu_pin_orphan_timeout_ms, int, 0644);
 MODULE_PARM_DESC(pin_orphan_timeout_ms,
-	"Force-unpin orphan BOs after N ms (0 = disabled, default 60000)");
+	"Force-unpin orphan BOs after N ms (0 = disabled, default 10000)");
 
 /**
  * DOC: pin_reaper_interval_ms (int) [V15.5 #3]
- * How often the reaper kthread scans the orphan list. Default 5000.
+ * How often the reaper kthread scans the orphan list. Default 2000.
+ * Reduced from 5000 to match the tighter pin_orphan_timeout_ms=10000
+ * so orphan BOs are reaped within one scan cycle after expiry.
  */
-int amdgpu_pin_reaper_interval_ms = 5000;
+int amdgpu_pin_reaper_interval_ms = 2000;
 module_param_named(pin_reaper_interval_ms, amdgpu_pin_reaper_interval_ms, int, 0644);
 MODULE_PARM_DESC(pin_reaper_interval_ms,
-	"Orphan reaper scan interval ms (default 5000)");
+	"Orphan reaper scan interval ms (default 2000)");
 
 /**
  * DOC: kfd_free_wait_ms (int) [V15.5 #2]
