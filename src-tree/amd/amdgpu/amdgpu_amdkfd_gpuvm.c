@@ -1818,8 +1818,20 @@ void amdgpu_amdkfd_gpuvm_unpin_bo(struct amdgpu_bo *bo)
 	}
 
 	/* Drain non-KFD fences (TTM moves, CS) before unpinning.
-	 * Mirrors the sync_wait in the pin path. */
-	amdgpu_bo_sync_wait(bo, AMDGPU_FENCE_OWNER_KFD, false);
+	 * Mirrors the sync_wait in the pin path.
+	 * DEATH-A2: use bounded wait to prevent permanent hang when
+	 * fences are stuck (e.g. GPU reset, SDMA hang). */
+	{
+		long w = amdgpu_bo_sync_wait_timeout_ms(
+			bo, AMDGPU_FENCE_OWNER_KFD, false,
+			amdgpu_rdma_dereg_timeout_ms);
+		if (w <= 0)
+			pr_warn_ratelimited(
+				"amdgpu: unpin sync_wait timeout: bo=%p "
+				"size=%lluMB after %dms\n",
+				bo, (u64)amdgpu_bo_size(bo) >> 20,
+				amdgpu_rdma_dereg_timeout_ms);
+	}
 
 	/* V15.5 #1 strict dereg drain: wait for *all* fences on the resv
 	 * (IB, MES, TTM moves, peer RDMA) before letting pin_count drop.

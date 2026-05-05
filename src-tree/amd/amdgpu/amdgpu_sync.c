@@ -473,6 +473,33 @@ int amdgpu_sync_wait(struct amdgpu_sync *sync, bool intr)
 }
 
 /**
+ * amdgpu_sync_wait_timeout - wait for fences with a jiffies budget
+ *
+ * Like amdgpu_sync_wait but bounded.  The budget is shared across all
+ * fences in the sync object: each dma_fence_wait_timeout consumes from
+ * the same pool of remaining jiffies.
+ *
+ * Returns remaining jiffies (>0) on success, 0 on timeout, <0 on error.
+ */
+long amdgpu_sync_wait_timeout(struct amdgpu_sync *sync, bool intr,
+			      unsigned long timeout)
+{
+	struct amdgpu_sync_entry *e;
+	struct hlist_node *tmp;
+	long left = timeout ? (long)timeout : 1;
+	int i;
+
+	hash_for_each_safe(sync->fences, i, tmp, e, node) {
+		left = dma_fence_wait_timeout(e->fence, intr, left);
+		if (left <= 0)
+			return left;
+		amdgpu_sync_entry_free(e);
+	}
+
+	return left;
+}
+
+/**
  * amdgpu_sync_free - free the sync object
  *
  * @sync: sync object to use

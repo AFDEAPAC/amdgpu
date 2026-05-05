@@ -574,6 +574,20 @@ MODULE_PARM_DESC(sdma_fence_watchdog_ms,
 module_param_named(sdma_fence_watchdog_ms, amdgpu_sdma_fence_watchdog_ms, uint, 0644);
 
 /**
+ * DOC: rdma_dereg_timeout_ms (uint)
+ * Bound (ms) for the fence wait inside amd_dma_unmap (RDMA
+ * deregistration path). 0 = unbounded (legacy). Default 4000.
+ */
+unsigned int amdgpu_rdma_dereg_timeout_ms = 4000;
+module_param_named(rdma_dereg_timeout_ms,
+                   amdgpu_rdma_dereg_timeout_ms,
+                   uint, 0644);
+MODULE_PARM_DESC(rdma_dereg_timeout_ms,
+	"Bound (ms) for the fence wait inside amd_dma_unmap, "
+	"preventing ibv_dereg_mr from hanging on stuck non-KFD fences. "
+	"0 = unbounded (legacy). Default 4000.");
+
+/**
  * DOC: disable_cu (charp)
  * Set to disable CUs (It's set like se.sh.cu,...). The default is NULL.
  */

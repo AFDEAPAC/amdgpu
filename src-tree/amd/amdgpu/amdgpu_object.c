@@ -1606,6 +1606,38 @@ int amdgpu_bo_sync_wait(struct amdgpu_bo *bo, void *owner, bool intr)
 }
 
 /**
+ * amdgpu_bo_sync_wait_timeout_ms - sync_wait with a millisecond budget
+ *
+ * Same semantics as amdgpu_bo_sync_wait (owner filtering via
+ * amdgpu_sync_resv with AMDGPU_SYNC_NE_OWNER), but waits at most
+ * @timeout_ms milliseconds.
+ *
+ * Returns: > 0 jiffies remaining on success, 0 on timeout, < 0 on error.
+ */
+long amdgpu_bo_sync_wait_timeout_ms(struct amdgpu_bo *bo, void *owner,
+                                    bool intr, unsigned int timeout_ms)
+{
+	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+	struct dma_resv *resv = amdkcl_ttm_resvp(&bo->tbo);
+	unsigned long timeout = timeout_ms ? msecs_to_jiffies(timeout_ms)
+	                                   : MAX_SCHEDULE_TIMEOUT;
+	struct amdgpu_sync sync;
+	long left;
+	int r;
+
+	amdgpu_sync_create(&sync);
+	r = amdgpu_sync_resv(adev, &sync, resv,
+			     AMDGPU_SYNC_NE_OWNER, owner);
+	if (r) {
+		amdgpu_sync_free(&sync);
+		return r;
+	}
+	left = amdgpu_sync_wait_timeout(&sync, intr, timeout);
+	amdgpu_sync_free(&sync);
+	return left;
+}
+
+/**
  * amdgpu_bo_gpu_offset - return GPU offset of bo
  * @bo:	amdgpu object for which we query the offset
  *

@@ -473,11 +473,26 @@ static int amd_dma_unmap(struct sg_table *sg_head, void *client_context,
 			mem_context->va,
 			mem_context->size);
 
-	/* Wait for non-KFD fences (TTM moves, CS) before releasing the
-	 * DMA mapping, preventing the RDMA NIC from accessing stale pages
-	 * after a TTM migration. */
+	/* K-2b: wait for non-KFD fences (TTM moves, CS) under a bounded
+	 * budget. Without the bound, a stuck SDMA fence or pending GPU
+	 * reset can make ibv_dereg_mr hang forever. */
 	amdgpu_bo_reserve(mem_context->bo, true);
-	amdgpu_bo_sync_wait(mem_context->bo, AMDGPU_FENCE_OWNER_KFD, false);
+	{
+		long w = amdgpu_bo_sync_wait_timeout_ms(
+			mem_context->bo, AMDGPU_FENCE_OWNER_KFD, false,
+			amdgpu_rdma_dereg_timeout_ms);
+		if (w <= 0) {
+			struct amdgpu_device *adev =
+				amdgpu_ttm_adev(mem_context->bo->tbo.bdev);
+			atomic64_inc(&adev->kfd.rdma_dereg_timeout_count);
+			pr_warn_ratelimited(
+				"amdgpu: rdma_dereg fence wait timeout: bo=%p "
+				"size=%lluMB after %dms (released anyway)\n",
+				mem_context->bo,
+				(u64)amdgpu_bo_size(mem_context->bo) >> 20,
+				amdgpu_rdma_dereg_timeout_ms);
+		}
+	}
 	amdgpu_bo_unreserve(mem_context->bo);
 
 	/* Release the mapped pages of buffer */
