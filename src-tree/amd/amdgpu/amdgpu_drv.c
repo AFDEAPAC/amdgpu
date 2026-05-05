@@ -888,6 +888,18 @@ MODULE_PARM_DESC(gtt_multi_window,
 	"Parallel GTT copy slots (1-4, default=1). Higher = less lock contention.");
 
 /**
+ * DOC: ttm_error_fence_timeout_ms (int)
+ * Max ms to wait for a fence in TTM error and OOM fallback paths.
+ * These are error/cleanup paths that normally never execute; bounding them
+ * prevents a stuck SDMA fence from blocking a kernel worker thread forever.
+ * Default 4000.
+ */
+int amdgpu_ttm_error_fence_timeout_ms = 4000;
+module_param_named(ttm_error_fence_timeout_ms, amdgpu_ttm_error_fence_timeout_ms, int, 0644);
+MODULE_PARM_DESC(ttm_error_fence_timeout_ms,
+	"Max ms to wait for fence in TTM error/OOM fallback paths (default 4000)");
+
+/**
  * DOC: gtt_lock_timeout_ms (int)
  * GTT window lock acquisition timeout in ms (Plan B). 0 = no timeout. Default 0.
  */

@@ -294,6 +294,7 @@ void amdgpu_vram_wipe_defer_fini(void);
 
 extern int amdgpu_gtt_multi_window;
 extern int amdgpu_gtt_lock_timeout_ms;
+extern int amdgpu_ttm_error_fence_timeout_ms;
 
 /* V15.5 RDMA pin watermark + orphan reaper + strict free/drain */
 extern unsigned int amdgpu_dmabuf_pin_warn_mb;

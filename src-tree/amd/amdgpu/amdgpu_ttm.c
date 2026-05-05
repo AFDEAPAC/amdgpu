@@ -520,8 +520,15 @@ static int amdgpu_move_blit(struct ttm_buffer_object *bo,
 	return r;
 
 error:
-	if (fence)
-		dma_fence_wait(fence, false);
+	if (fence) {
+		int ms = READ_ONCE(amdgpu_ttm_error_fence_timeout_ms);
+
+		if (ms > 0)
+			dma_fence_wait_timeout(fence, false,
+					       msecs_to_jiffies(ms));
+		else
+			dma_fence_wait(fence, false);
+	}
 	dma_fence_put(fence);
 	return r;
 }
