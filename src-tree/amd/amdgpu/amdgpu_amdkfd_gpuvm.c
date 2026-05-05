@@ -2402,9 +2402,27 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
 
 	/* Make sure restore is not running concurrently. Since we
 	 * don't map invalid userptr BOs, we rely on the next restore
-	 * worker to do the mapping
+	 * worker to do the mapping.
+	 *
+	 * K-7.9: Use bounded trylock to avoid permanent hang when many
+	 * concurrent MapMemoryToGPU ioctls contend on process_info->lock.
 	 */
-	mutex_lock(&mem->process_info->lock);
+	if (amdgpu_kfd_map_memory_timeout_ms > 0) {
+		unsigned long deadline = jiffies +
+			msecs_to_jiffies(amdgpu_kfd_map_memory_timeout_ms);
+		while (!mutex_trylock(&mem->process_info->lock)) {
+			if (time_after(jiffies, deadline)) {
+				pr_warn_ratelimited(
+					"amdkfd: map_memory_to_gpu: process_info lock timeout (%d ms) pid=%d\n",
+					amdgpu_kfd_map_memory_timeout_ms,
+					current->pid);
+				return -ETIME;
+			}
+			msleep(5);
+		}
+	} else {
+		mutex_lock(&mem->process_info->lock);
+	}
 
 	/* Lock notifier lock. If we find an invalid userptr BO, we can be
 	 * sure that the MMU notifier is no longer running

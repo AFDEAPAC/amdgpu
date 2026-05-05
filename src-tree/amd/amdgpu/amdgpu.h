@@ -300,6 +300,7 @@ extern unsigned int amdgpu_dmabuf_pin_critical_mb;
 extern int amdgpu_pin_orphan_timeout_ms;
 extern int amdgpu_pin_reaper_interval_ms;
 extern int amdgpu_kfd_free_wait_ms;
+extern int amdgpu_kfd_map_memory_timeout_ms;
 extern int amdgpu_kfd_free_on_pinned;
 extern int amdgpu_kfd_unpin_drain_ms;
 

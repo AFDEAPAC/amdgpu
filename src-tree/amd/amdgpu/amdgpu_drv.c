@@ -954,6 +954,20 @@ MODULE_PARM_DESC(kfd_free_wait_ms,
 	"Bounded wait for RDMA unpin on hipFree (0=no wait, default 3000)");
 
 /**
+ * DOC: kfd_map_memory_timeout_ms (int) [V17.5 K-7.9]
+ * Wall-clock timeout for the process_info->lock mutex in
+ * amdgpu_amdkfd_gpuvm_map_memory_to_gpu.  When many concurrent
+ * hipHostMalloc/MapMemoryToGPU ioctls contend on this lock and one
+ * holder is blocked in vm_validate (fence wait), all other threads
+ * hang indefinitely.  This param bounds the mutex_lock to a trylock
+ * + msleep retry loop.  0 = unlimited (legacy). Default 4000 ms.
+ */
+int amdgpu_kfd_map_memory_timeout_ms = 4000;
+module_param_named(kfd_map_memory_timeout_ms, amdgpu_kfd_map_memory_timeout_ms, int, 0644);
+MODULE_PARM_DESC(kfd_map_memory_timeout_ms,
+	"Timeout for MapMemoryToGPU process_info lock (0=unlimited, default 4000)");
+
+/**
  * DOC: kfd_free_on_pinned (int) [V15.5 #2, NOFAIL variant]
  *    0 = silent queue-to-orphan-list on pinned free (V15.3 behaviour)
  *    1 = bounded wait kfd_free_wait_ms then queue-to-orphan-list (default)
