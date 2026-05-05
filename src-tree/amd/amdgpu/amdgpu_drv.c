@@ -925,12 +925,12 @@ MODULE_PARM_DESC(dmabuf_pin_critical_mb,
  * DOC: pin_orphan_timeout_ms (int) [V15.5 #3]
  * A BO that is freed by userspace while still RDMA-pinned is queued on an
  * orphan list. After this many milliseconds the reaper kthread force-unpins
- * it and releases the VRAM. Default 60000 (1 minute).
+ * it and releases the VRAM. Default 30000 (30 seconds).
  */
-int amdgpu_pin_orphan_timeout_ms = 60000;
+int amdgpu_pin_orphan_timeout_ms = 30000;
 module_param_named(pin_orphan_timeout_ms, amdgpu_pin_orphan_timeout_ms, int, 0644);
 MODULE_PARM_DESC(pin_orphan_timeout_ms,
-	"Force-unpin orphan BOs after N ms (0 = disabled, default 60000)");
+	"Force-unpin orphan BOs after N ms (0 = disabled, default 30000)");
 
 /**
  * DOC: pin_reaper_interval_ms (int) [V15.5 #3]
