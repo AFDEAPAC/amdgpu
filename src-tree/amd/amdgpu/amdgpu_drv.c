@@ -901,12 +901,15 @@ MODULE_PARM_DESC(ttm_error_fence_timeout_ms,
 
 /**
  * DOC: gtt_lock_timeout_ms (int)
- * GTT window lock acquisition timeout in ms (Plan B). 0 = no timeout. Default 0.
+ * GTT window lock acquisition timeout in ms (Plan B). 0 = no timeout. Default 4000.
+ * The previous default of 0 (wait forever) could deadlock under RDMA quota exhaustion
+ * when multiple threads contend for the GTT window lock while holding resources the
+ * lock holder needs. Gold settings already set this to 4000 via modprobe.d.
  */
-int amdgpu_gtt_lock_timeout_ms = 0;
+int amdgpu_gtt_lock_timeout_ms = 4000;
 module_param_named(gtt_lock_timeout_ms, amdgpu_gtt_lock_timeout_ms, int, 0644);
 MODULE_PARM_DESC(gtt_lock_timeout_ms,
-	"GTT lock timeout ms (0=wait forever (default), >0=return -EAGAIN on timeout)");
+	"GTT lock timeout ms (0=wait forever, >0=return -EAGAIN on timeout, default 4000)");
 
 /**
  * DOC: reserved_copy_pool_mb (int)
