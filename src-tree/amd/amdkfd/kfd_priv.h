@@ -1693,6 +1693,7 @@ void kfd_signal_vm_fault_event(struct kfd_process_device *pdd,
 				struct kfd_hsa_memory_exception_data *data);
 
 void kfd_signal_reset_event(struct kfd_node *dev);
+void kfd_signal_evicted_queue_events(struct kfd_process *p);
 
 void kfd_signal_poison_consumed_event(struct kfd_node *dev, u32 pasid);
 

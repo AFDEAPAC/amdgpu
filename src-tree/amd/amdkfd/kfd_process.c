@@ -2249,6 +2249,8 @@ static void evict_process_worker(struct work_struct *work)
 	pr_debug("Started evicting process pid %d\n", p->lead_thread->pid);
 	ret = kfd_process_evict_queues(p, false, KFD_QUEUE_EVICTION_TRIGGER_TTM);
 	if (!ret) {
+		kfd_signal_evicted_queue_events(p);
+
 		/* If another thread already signaled the eviction fence,
 		 * they are responsible stopping the queues and scheduling
 		 * the restore work.

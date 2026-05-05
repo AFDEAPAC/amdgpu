@@ -1421,6 +1421,23 @@ void kfd_signal_reset_event(struct kfd_node *dev)
 	srcu_read_unlock(&kfd_processes_srcu, idx);
 }
 
+void kfd_signal_evicted_queue_events(struct kfd_process *p)
+{
+	struct kfd_event *ev;
+	uint32_t id;
+
+	rcu_read_lock();
+	id = KFD_FIRST_NONSIGNAL_EVENT_ID;
+	idr_for_each_entry_continue(&p->event_idr, ev, id) {
+		if (ev->type == KFD_EVENT_TYPE_SIGNAL) {
+			spin_lock(&ev->lock);
+			set_event(ev);
+			spin_unlock(&ev->lock);
+		}
+	}
+	rcu_read_unlock();
+}
+
 void kfd_signal_poison_consumed_event(struct kfd_node *dev, u32 pasid)
 {
 	struct kfd_process *p = kfd_lookup_process_by_pasid(pasid, NULL);
