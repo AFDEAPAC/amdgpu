@@ -1550,8 +1550,13 @@ void amdgpu_bo_fence(struct amdgpu_bo *bo, struct dma_fence *fence,
 
 	r = dma_resv_reserve_fences(resv, 1);
 	if (r) {
-		/* As last resort on OOM we block for the fence */
-		dma_fence_wait(fence, false);
+		int ms = READ_ONCE(amdgpu_ttm_error_fence_timeout_ms);
+
+		if (ms > 0)
+			dma_fence_wait_timeout(fence, false,
+					       msecs_to_jiffies(ms));
+		else
+			dma_fence_wait(fence, false);
 		return;
 	}
 
