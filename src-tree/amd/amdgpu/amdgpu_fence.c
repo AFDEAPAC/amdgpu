@@ -296,6 +296,61 @@ static void amdgpu_fence_fallback(struct timer_list *t)
 
 	if (amdgpu_fence_process(ring))
 		DRM_WARN("Fence fallback timer expired on ring %s\n", ring->name);
+
+	/*
+	 * SDMA fence watchdog: when an SDMA engine is frozen (e.g. staging
+	 * pin failure under RDMA quota exhaustion), the completion fence
+	 * never signals and dma_fence_wait / KFD WAIT_EVENTS / ROCr
+	 * WaitRelaxed hang indefinitely.  If sdma_fence_watchdog_ms is set,
+	 * check the oldest pending fence on SDMA rings and force-complete
+	 * all pending fences with -ETIMEDOUT when the threshold is exceeded.
+	 *
+	 * Note: amdgpu_fence_process() calls timer_delete/del_timer which
+	 * returns 0 when invoked from within the timer callback (timer is
+	 * executing, not pending), so the fallback timer is NOT re-armed by
+	 * amdgpu_fence_process().  We must re-arm it here if fences remain
+	 * pending, otherwise the watchdog never gets another chance to fire.
+	 */
+	if (amdgpu_sdma_fence_watchdog_ms > 0 &&
+	    ring->funcs->type == AMDGPU_RING_TYPE_SDMA) {
+		uint32_t last_seq = atomic_read(&ring->fence_drv.last_seq);
+		uint32_t sync_seq = READ_ONCE(ring->fence_drv.sync_seq);
+
+		if (last_seq != sync_seq) {
+			uint32_t idx = (last_seq + 1) &
+				       ring->fence_drv.num_fences_mask;
+			struct dma_fence *f;
+
+			rcu_read_lock();
+			f = rcu_dereference(ring->fence_drv.fences[idx]);
+			if (f && dma_fence_get_rcu(f)) {
+				s64 elapsed_ms = ktime_ms_delta(ktime_get(),
+					to_amdgpu_fence(f)->start_timestamp);
+
+				if (elapsed_ms >= (s64)amdgpu_sdma_fence_watchdog_ms) {
+					rcu_read_unlock();
+					dev_warn_ratelimited(ring->adev->dev,
+						"amdgpu: SDMA watchdog: ring %s fence seq %u "
+						"stuck for %lld ms, force-completing "
+						"(sdma_fence_watchdog_ms=%u)\n",
+						ring->name, last_seq + 1,
+						elapsed_ms,
+						amdgpu_sdma_fence_watchdog_ms);
+					amdgpu_fence_driver_set_error(ring,
+								      -ETIMEDOUT);
+					amdgpu_fence_write(ring,
+							   ring->fence_drv.sync_seq);
+					amdgpu_fence_process(ring);
+					dma_fence_put(f);
+					return;
+				}
+				dma_fence_put(f);
+			}
+			rcu_read_unlock();
+
+			amdgpu_fence_schedule_fallback(ring);
+		}
+	}
 }
 
 /**

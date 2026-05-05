@@ -49,18 +49,11 @@
 #include <kcl/kcl_drm_suballoc.h>
 #include <linux/module.h>
 
-/* V15.3 + K-8: bounded wait so release/teardown paths (notably
+/* V15.3: bounded wait so release/teardown paths (notably
  * amdgpu_bo_release_notify -> amdgpu_fill_buffer -> amdgpu_ib_get ->
  * amdgpu_sa_bo_new -> drm_suballoc_new) cannot stall forever when the
  * SDMA IB sub-allocator is saturated. Default 4000 ms matches HIP's
  * app-level hang timeout so any stall is visible and finite.
- *
- * V15.3 covered the count > 0 (have-fences) branch of drm_suballoc_new,
- * using dma_fence_wait_any_timeout(). K-8 (V17.5-final-k71) extends
- * the same knob to cover the count == 0 branches: both the
- * interruptible (wait_event_interruptible_timeout) and the
- * non-interruptible (wait_event_timeout) waits. Together V15.3 + K-8
- * close every wait in drm_suballoc_new with the same wall-clock cap.
  *
  *   modprobe amdkcl suballoc_timeout_ms=4000
  *   echo 4000 > /sys/module/amdkcl/parameters/suballoc_timeout_ms
@@ -68,7 +61,7 @@
 static int suballoc_timeout_ms = 4000;
 module_param(suballoc_timeout_ms, int, 0644);
 MODULE_PARM_DESC(suballoc_timeout_ms,
-    "Max ms to wait in drm_suballoc_new before returning -ETIME (V15.3 covers have-fences path; K-8 covers no-fence paths; default 4000)");
+    "Max ms to wait for IB sub-alloc slot before returning -ETIME (V15.3; default 4000)");
 
 #ifndef HAVE_DRM_SUBALLOC_MANAGER_INIT
 static void drm_suballoc_remove_locked(struct drm_suballoc *sa);
@@ -413,78 +406,52 @@ drm_suballoc_new(struct drm_suballoc_manager *sa_manager, size_t size,
 			}
 			spin_lock(&sa_manager->wq.lock);
 		} else if (intr) {
-			/* K-8: bound the no-fence wait too. The V15.3 fix only
-			 * covers the count > 0 (have-fences) path above. When
-			 * count == 0 we get here -- it means no fence is yet
-			 * associated with the manager's free-list, but the
-			 * suballoc still has no room. Without K-8 this was
-			 * wait_event_interruptible_locked() which has no
-			 * upper bound: if condition never becomes true (e.g.
-			 * upstream producer wedged), we wait forever.
-			 *
-			 * Reuse the existing suballoc_timeout_ms knob (default
-			 * 4000 ms). On expiry, return -ETIME so the outer
-			 * do { ... } while (!r) loop drops out, the caller
-			 * gets ERR_PTR(-ETIME), and survival policy kicks in. */
-			int ms = READ_ONCE(suballoc_timeout_ms);
-			long t;
-			long timeout_j;
-
-			if (ms <= 0)
-				ms = 4000;
-			else if (ms < 100)
-				ms = 100;
-			timeout_j = msecs_to_jiffies(ms);
-
+			/* K-8: bound count==0 path with suballoc_timeout_ms */
+			int k8_ms = READ_ONCE(suballoc_timeout_ms);
+			long k8_to;
+			if (k8_ms <= 0)
+				k8_ms = 4000;
+			else if (k8_ms < 100)
+				k8_ms = 100;
+			k8_to = msecs_to_jiffies(k8_ms);
 			spin_unlock(&sa_manager->wq.lock);
-			t = wait_event_interruptible_timeout(
-				sa_manager->wq,
-				drm_suballoc_event(sa_manager, size, align),
-				timeout_j);
-			spin_lock(&sa_manager->wq.lock);
-
-			if (t == 0) {
+			r = wait_event_interruptible_timeout(
+					sa_manager->wq,
+					drm_suballoc_event(sa_manager,
+							   size, align),
+					k8_to);
+			if (r == 0) {
 				pr_warn_ratelimited(
-					"amdkcl: K-8 suballoc no-fence TIMEOUT after %d ms (intr); pid=%d comm=%s\n",
-					ms, current->pid, current->comm);
+					"amdkcl: suballoc count==0 TIMEOUT after %d ms (intr); pid=%d comm=%s\n",
+					k8_ms, current->pid, current->comm);
 				r = -ETIME;
-			} else if (t < 0) {
-				/* signal received: -ERESTARTSYS */
-				r = t;
-			} else {
+			} else if (r > 0) {
 				r = 0;
 			}
+			spin_lock(&sa_manager->wq.lock);
 		} else {
-			/* K-8: same wall-clock cap for the non-interruptible
-			 * path. Without K-8 this was wait_event() which
-			 * neither timed out nor woke on signals -- the
-			 * dominant 100+ second hang shape from the
-			 * sdma_suballoc_hang reproducer. */
-			int ms = READ_ONCE(suballoc_timeout_ms);
-			long t;
-			long timeout_j;
-
-			if (ms <= 0)
-				ms = 4000;
-			else if (ms < 100)
-				ms = 100;
-			timeout_j = msecs_to_jiffies(ms);
-
+			/* K-8: bound count==0 path with suballoc_timeout_ms */
+			int k8_ms = READ_ONCE(suballoc_timeout_ms);
+			long k8_to;
+			if (k8_ms <= 0)
+				k8_ms = 4000;
+			else if (k8_ms < 100)
+				k8_ms = 100;
+			k8_to = msecs_to_jiffies(k8_ms);
 			spin_unlock(&sa_manager->wq.lock);
-			t = wait_event_timeout(
-				sa_manager->wq,
-				drm_suballoc_event(sa_manager, size, align),
-				timeout_j);
-			spin_lock(&sa_manager->wq.lock);
-
-			if (t == 0) {
+			r = wait_event_timeout(sa_manager->wq,
+					drm_suballoc_event(sa_manager,
+							   size, align),
+					k8_to);
+			if (r == 0) {
 				pr_warn_ratelimited(
-					"amdkcl: K-8 suballoc no-fence TIMEOUT after %d ms (uninter); pid=%d comm=%s\n",
-					ms, current->pid, current->comm);
+					"amdkcl: suballoc count==0 TIMEOUT after %d ms; pid=%d comm=%s\n",
+					k8_ms, current->pid, current->comm);
 				r = -ETIME;
-			} else {
+			} else if (r > 0) {
 				r = 0;
 			}
+			spin_lock(&sa_manager->wq.lock);
 		}
 	} while (!r);
 

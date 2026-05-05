@@ -198,6 +198,7 @@ extern uint amdgpu_pcie_lane_cap;
 extern u64 amdgpu_cg_mask;
 extern uint amdgpu_pg_mask;
 extern uint amdgpu_sdma_phase_quantum;
+extern uint amdgpu_sdma_fence_watchdog_ms;
 extern char *amdgpu_disable_cu;
 extern char *amdgpu_virtual_display;
 extern uint amdgpu_pp_feature_mask;

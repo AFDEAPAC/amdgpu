@@ -181,6 +181,7 @@ uint amdgpu_pcie_lane_cap;
 u64 amdgpu_cg_mask = 0xffffffffffffffff;
 uint amdgpu_pg_mask = 0xffffffff;
 uint amdgpu_sdma_phase_quantum = 32;
+uint amdgpu_sdma_fence_watchdog_ms;
 char *amdgpu_disable_cu;
 char *amdgpu_virtual_display;
 int amdgpu_enforce_isolation = -1;
@@ -557,6 +558,20 @@ module_param_named(pg_mask, amdgpu_pg_mask, uint, 0444);
  */
 MODULE_PARM_DESC(sdma_phase_quantum, "SDMA context switch phase quantum (x 1K GPU clock cycles, 0 = no change (default 32))");
 module_param_named(sdma_phase_quantum, amdgpu_sdma_phase_quantum, uint, 0444);
+
+/**
+ * DOC: sdma_fence_watchdog_ms (uint)
+ * Force-complete SDMA fences stuck longer than this many milliseconds.
+ * When an SDMA engine is frozen (e.g. staging pin failure under RDMA quota
+ * exhaustion), the completion fence never signals and waiters hang.  This
+ * watchdog checks pending SDMA fences in the existing fallback timer and
+ * force-completes them with -ETIMEDOUT after the configured threshold,
+ * unblocking KFD WAIT_EVENTS and ROCr WaitRelaxed regardless of userspace
+ * ENV settings.  0 = disabled (default).
+ */
+MODULE_PARM_DESC(sdma_fence_watchdog_ms,
+	"Force-complete SDMA fences stuck longer than this (ms, 0=disabled, default=0)");
+module_param_named(sdma_fence_watchdog_ms, amdgpu_sdma_fence_watchdog_ms, uint, 0644);
 
 /**
  * DOC: disable_cu (charp)

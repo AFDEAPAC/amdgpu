@@ -35,9 +35,18 @@
 #include "../amdgpu/amdgpu_reset.h"
 #include <linux/device.h>
 
-/* V17.4 #4 P0: bound the WaitRelaxed/INFINITE wait so a stuck GPU
- * (no formal reset, no event signal) cannot pin a process forever. */
-#define KFD_EVENT_INFINITE_TIMEOUT_MS	30000
+/*
+ * V17.5: wall-clock ceiling on KFD WAIT_EVENTS.  When an SDMA engine is
+ * frozen (RDMA pin quota exhaustion) the completion event never fires and
+ * the caller hangs in schedule_timeout forever.  This parameter caps the
+ * wait so the caller gets -ETIME and can enter the CLR degraded-mode path.
+ * 0 = disabled (dangerous — infinite waits are truly infinite).
+ */
+static uint kfd_wait_max_ms_per_wall = 30000;
+module_param(kfd_wait_max_ms_per_wall, uint, 0644);
+MODULE_PARM_DESC(kfd_wait_max_ms_per_wall,
+	"Wall-clock ceiling for KFD WAIT_EVENTS (ms, 0=disabled, default=30000)");
+
 #define KFD_EVENT_RESET_POLL_MS		2000
 
 /*
@@ -1011,6 +1020,10 @@ int kfd_wait_on_events(struct kfd_process *p,
 	 * INFINITE-timeout path so a permanently stuck GPU returns
 	 * -ETIME instead of hanging the caller forever. */
 	const unsigned long wait_start = jiffies;
+	const unsigned long wall_deadline =
+		(kfd_wait_max_ms_per_wall > 0)
+			? wait_start + msecs_to_jiffies(kfd_wait_max_ms_per_wall)
+			: 0;
 
 	while (true) {
 		uint32_t k;
@@ -1054,12 +1067,27 @@ int kfd_wait_on_events(struct kfd_process *p,
 		 * kfd_signal_reset_event() (no compute queues -> no
 		 * has_reset_queue), so without this cap the INFINITE path
 		 * sleeps forever waiting on an event that never fires.
+		 *
+		 * V17.5 SLA: clamp each sleep by the remaining wall-clock
+		 * budget so we never overshoot kfd_wait_max_ms_per_wall
+		 * by a full poll interval.
 		 */
 		if (*user_timeout_ms == KFD_EVENT_TIMEOUT_INFINITE) {
-			schedule_timeout(msecs_to_jiffies(KFD_EVENT_RESET_POLL_MS));
+			long poll = msecs_to_jiffies(KFD_EVENT_RESET_POLL_MS);
+			if (wall_deadline) {
+				long wr = (long)(wall_deadline - jiffies);
+				if (wr <= 0) { ret = -ETIME; break; }
+				poll = min_t(long, poll, wr);
+			}
+			schedule_timeout(poll);
 		} else {
 			sleep_jiffies = min_t(long, timeout,
 					      msecs_to_jiffies(KFD_EVENT_RESET_POLL_MS));
+			if (wall_deadline) {
+				long wr = (long)(wall_deadline - jiffies);
+				if (wr <= 0) { ret = -ETIME; break; }
+				sleep_jiffies = min_t(long, sleep_jiffies, wr);
+			}
 			timeout -= sleep_jiffies - schedule_timeout(sleep_jiffies);
 		}
 
@@ -1075,14 +1103,17 @@ int kfd_wait_on_events(struct kfd_process *p,
 			}
 		}
 
-		/* Absolute timeout for INFINITE waits: catches GPU stuck
+		/* V17.5: absolute wall-clock ceiling.  Catches GPU stuck
 		 * at 100% without triggering a formal reset
-		 * (amdgpu_reset_pending stays false).  ROCr will check GPU
+		 * (amdgpu_reset_pending stays false).  Applies to both
+		 * INFINITE and finite waits so a very large user timeout
+		 * (e.g. 0x7FFFFFFF ~ 24 days) cannot hang the caller
+		 * beyond the configured limit.  ROCr will check GPU
 		 * health and retry / recover. */
 		if (ret != -ETIME &&
-		    *user_timeout_ms == KFD_EVENT_TIMEOUT_INFINITE &&
+		    kfd_wait_max_ms_per_wall > 0 &&
 		    time_after(jiffies, wait_start +
-				       msecs_to_jiffies(KFD_EVENT_INFINITE_TIMEOUT_MS)))
+				       msecs_to_jiffies(kfd_wait_max_ms_per_wall)))
 			ret = -ETIME;
 
 		if (ret == -ETIME)
