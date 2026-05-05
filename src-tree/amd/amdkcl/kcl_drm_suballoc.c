@@ -63,6 +63,11 @@ module_param(suballoc_timeout_ms, int, 0644);
 MODULE_PARM_DESC(suballoc_timeout_ms,
     "Max ms to wait for IB sub-alloc slot before returning -ETIME (V15.3; default 4000)");
 
+static int suballoc_force_reclaim = 1;
+module_param(suballoc_force_reclaim, int, 0644);
+MODULE_PARM_DESC(suballoc_force_reclaim,
+    "Force-signal stuck fences on suballoc timeout to prevent pool shrink (default 1)");
+
 #ifndef HAVE_DRM_SUBALLOC_MANAGER_INIT
 static void drm_suballoc_remove_locked(struct drm_suballoc *sa);
 static void drm_suballoc_try_free(struct drm_suballoc_manager *sa_manager);
@@ -307,6 +312,43 @@ static bool drm_suballoc_next_hole(struct drm_suballoc_manager *sa_manager,
 	return false;
 }
 
+/*
+ * drm_suballoc_force_reclaim_stale - Force-signal unsignaled fences in the pool
+ *
+ * Called with sa_manager->wq.lock held after a suballoc timeout. Walks all
+ * per-queue free-lists and force-signals any unsignaled fence, then runs
+ * try_free to reclaim those slots. This prevents the pool from permanently
+ * shrinking when SDMA fences get stuck.
+ *
+ * Safety: dma_fence_signal on an already-signaled fence is a no-op.
+ * Force-signaling a stuck fence tells waiters "work completed" even though
+ * it did not; callers of drm_suballoc_new already handle the -ETIME error
+ * and do not assume the fence indicates actual completion.
+ */
+static void drm_suballoc_force_reclaim_stale(
+		struct drm_suballoc_manager *sa_manager)
+{
+	unsigned int i;
+	struct drm_suballoc *sa;
+	int reclaimed = 0;
+
+	for (i = 0; i < DRM_SUBALLOC_MAX_QUEUES; ++i) {
+		list_for_each_entry(sa, &sa_manager->flist[i], flist) {
+			if (sa->fence && !dma_fence_is_signaled(sa->fence)) {
+				dma_fence_signal(sa->fence);
+				reclaimed++;
+			}
+		}
+	}
+
+	if (reclaimed > 0) {
+		drm_suballoc_try_free(sa_manager);
+		pr_info_ratelimited(
+			"amdkcl: suballoc force-reclaimed %d stale slots\n",
+			reclaimed);
+	}
+}
+
 /**
  * drm_suballoc_new() - Make a suballocation.
  * @sa_manager: pointer to the sa_manager
@@ -454,6 +496,9 @@ drm_suballoc_new(struct drm_suballoc_manager *sa_manager, size_t size,
 			spin_lock(&sa_manager->wq.lock);
 		}
 	} while (!r);
+
+	if (r == -ETIME && READ_ONCE(suballoc_force_reclaim))
+		drm_suballoc_force_reclaim_stale(sa_manager);
 
 	spin_unlock(&sa_manager->wq.lock);
 	kfree(sa);
