@@ -455,18 +455,61 @@ int amdgpu_sync_push_to_job(struct amdgpu_sync *sync, struct amdgpu_job *job)
 	return 0;
 }
 
+/* FIX-K1 V17.5-rc3: shared safety wall for amdgpu_sync_wait. The original
+ * call invoked dma_fence_wait(unbounded) which can sleep forever when an
+ * SDMA fence is wedged (e.g. RDMA pin quota exhaustion + cgroup eviction
+ * cascade). Five callers in KFD GPUVM mgmt + SVM + VM update use this
+ * unbounded path (amdgpu_amdkfd_gpuvm.c:438/1520/1737, kfd_svm.c:626,
+ * amdgpu_vm.c:2719); none of them want to hang indefinitely.
+ *
+ * Modparam bo_sync_wait_max_ms (default 30000ms = 30s) is a generous
+ * worst-case wall: any legitimate KFD/SVM fence completes far below
+ * this in practice (SDMA copies are bounded by sdma_fence_watchdog_ms
+ * which defaults to 30000ms; this matches that ceiling). When the wall
+ * fires the call returns -ETIME and the caller's existing error-handling
+ * path runs. 0 = legacy unbounded behaviour for rollback safety. */
+static unsigned int amdgpu_bo_sync_wait_max_ms = 30000;
+module_param_named(bo_sync_wait_max_ms, amdgpu_bo_sync_wait_max_ms, uint, 0644);
+MODULE_PARM_DESC(bo_sync_wait_max_ms,
+	"FIX-K1 V17.5-rc3: wall-clock cap (ms) for amdgpu_sync_wait, "
+	"prevents kernel-side amdgpu_bo_sync_wait callers from hanging "
+	"on stuck SDMA/KFD fences. 0 = legacy unbounded. Default 30000.");
+
 int amdgpu_sync_wait(struct amdgpu_sync *sync, bool intr)
 {
 	struct amdgpu_sync_entry *e;
 	struct hlist_node *tmp;
-	int i, r;
+	int i;
+	unsigned int cap_ms = READ_ONCE(amdgpu_bo_sync_wait_max_ms);
 
-	hash_for_each_safe(sync->fences, i, tmp, e, node) {
-		r = dma_fence_wait(e->fence, intr);
-		if (r)
-			return r;
+	if (cap_ms == 0) {
+		/* Legacy unbounded path retained for rollback safety. */
+		long r;
+		hash_for_each_safe(sync->fences, i, tmp, e, node) {
+			r = dma_fence_wait(e->fence, intr);
+			if (r)
+				return (int)r;
+			amdgpu_sync_entry_free(e);
+		}
+		return 0;
+	}
 
-		amdgpu_sync_entry_free(e);
+	{
+		unsigned long left = msecs_to_jiffies(cap_ms);
+		long t;
+		hash_for_each_safe(sync->fences, i, tmp, e, node) {
+			t = dma_fence_wait_timeout(e->fence, intr, left);
+			if (t == 0) {
+				pr_warn_ratelimited(
+					"amdgpu: FIX-K1 amdgpu_sync_wait TIMEOUT after %u ms (fence stuck) pid=%d comm=%s\n",
+					cap_ms, current->pid, current->comm);
+				return -ETIME;
+			}
+			if (t < 0)
+				return (int)t;
+			left = (unsigned long)t;
+			amdgpu_sync_entry_free(e);
+		}
 	}
 
 	return 0;
