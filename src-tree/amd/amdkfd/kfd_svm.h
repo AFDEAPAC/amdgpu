@@ -138,6 +138,17 @@ struct svm_range {
 	DECLARE_BITMAP(bitmap_aip, MAX_GPU_INSTANCE);
 	bool				mapped_to_gpu;
 	atomic_t			queue_refcount;
+
+	/*
+	 * V17.5 Phase C: pin user-space CWSR pages so kernel direct reclaim
+	 * cannot trigger MMU_NOTIFY_UNMAP -> queue eviction. Populated by
+	 * kfd_queue_buffer_svm_get() and released by kfd_queue_buffer_svm_put()
+	 * when queue_refcount drops to zero. Owned exclusively by the prange
+	 * that originally took the pin; split siblings must NOT inherit it.
+	 */
+	struct page			**pinned_pages;
+	unsigned long			pinned_npages;
+	bool				gup_pinned;
 };
 
 static inline void svm_range_lock(struct svm_range *prange)

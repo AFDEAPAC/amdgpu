@@ -1160,6 +1160,15 @@ struct kfd_process {
 
 	/* Indicates process' PC Sampling ref cnt*/
 	uint32_t pc_sampling_ref;
+
+	/*
+	 * V17.5 Phase C: aggregate accounting of pinned user CWSR pages.
+	 * Updated by kfd_queue_buffer_svm_get/put under p->svms.lock.
+	 * Used to enforce kfd_pin_queue_svm_max_mb cap and exposed via
+	 * /sys/class/kfd/kfd/proc/<pid>/pinned_svm_{bytes,ranges}.
+	 */
+	atomic_long_t pinned_svm_bytes;
+	atomic_t pinned_svm_ranges;
 };
 
 #define KFD_PROCESS_TABLE_SIZE 5 /* bits: 32 entries */
