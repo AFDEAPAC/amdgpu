@@ -305,6 +305,9 @@ extern int amdgpu_kfd_free_wait_ms;
 extern int amdgpu_kfd_free_on_pinned;
 extern int amdgpu_kfd_unpin_drain_ms;
 
+/* V17.5 Phase A: cgroup-aware GTT allocation gate (opt-in, default 0). */
+extern uint amdgpu_gtt_cgroup_reserve_mb;
+
 struct amdgpu_device;
 struct amdgpu_bo;
 

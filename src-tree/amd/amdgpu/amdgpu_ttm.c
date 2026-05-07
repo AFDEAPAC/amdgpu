@@ -44,6 +44,10 @@
 #include <linux/dma-buf.h>
 #include <linux/sizes.h>
 #include <linux/module.h>
+#ifdef CONFIG_MEMCG
+#include <linux/memcontrol.h>
+#include <linux/page_counter.h>
+#endif
 
 #include <drm/drm_drv.h>
 #include <drm/ttm/ttm_bo.h>
@@ -1440,6 +1444,57 @@ static struct ttm_tt *amdgpu_ttm_tt_create(struct ttm_buffer_object *bo,
 }
 
 /*
+ * V17.5 Phase A: query the calling process's cgroup memcg for remaining
+ * memory budget. Returns ULONG_MAX when the gate cannot make a meaningful
+ * decision (root memcg, kthread, MEMCG disabled, etc.); the caller treats
+ * that as "no limit" and proceeds.
+ *
+ * Default off; activated only when amdgpu_gtt_cgroup_reserve_mb > 0.
+ */
+#ifdef CONFIG_MEMCG
+static unsigned long amdgpu_memcg_avail_bytes(void)
+{
+	struct mem_cgroup *memcg;
+	unsigned long max_pages, usage_pages;
+
+	if (mem_cgroup_disabled())
+		return ULONG_MAX;
+
+	/*
+	 * kthread / interrupt context cannot meaningfully be charged to a
+	 * user cgroup; fall through to "no limit" so internal allocations
+	 * are not gated.
+	 */
+	if (!current->mm || (current->flags & PF_KTHREAD))
+		return ULONG_MAX;
+
+	rcu_read_lock();
+	memcg = mem_cgroup_from_task(current);
+	if (!memcg) {
+		rcu_read_unlock();
+		return ULONG_MAX;
+	}
+	css_get(&memcg->css);
+	rcu_read_unlock();
+
+	max_pages = READ_ONCE(memcg->memory.max);
+	usage_pages = page_counter_read(&memcg->memory);
+	css_put(&memcg->css);
+
+	if (max_pages >= PAGE_COUNTER_MAX)
+		return ULONG_MAX;
+	if (usage_pages >= max_pages)
+		return 0;
+	return (max_pages - usage_pages) << PAGE_SHIFT;
+}
+#else
+static unsigned long amdgpu_memcg_avail_bytes(void)
+{
+	return ULONG_MAX;
+}
+#endif
+
+/*
  * amdgpu_ttm_tt_populate - Map GTT pages visible to the device
  *
  * Map the pages of a ttm_tt object to an address space visible
@@ -1465,6 +1520,30 @@ static int amdgpu_ttm_tt_populate(struct ttm_device *bdev,
 
 	if (ttm->page_flags & TTM_TT_FLAG_EXTERNAL)
 		return 0;
+
+	/*
+	 * V17.5 Phase A: cgroup-aware GTT gate. Reject GTT page allocation
+	 * early when the calling process's cgroup memcg is below a
+	 * configured reserve. This surfaces as -ENOMEM up to user-space
+	 * (-> hipErrorOutOfMemory) instead of letting the kernel OOM-killer
+	 * choose the GPU service process.
+	 *
+	 * Opt-in: default 0 disables. Set non-zero to enable.
+	 */
+	if (amdgpu_gtt_cgroup_reserve_mb > 0) {
+		unsigned long need = (unsigned long)ttm->num_pages << PAGE_SHIFT;
+		unsigned long reserve =
+			(unsigned long)amdgpu_gtt_cgroup_reserve_mb << 20;
+		unsigned long avail = amdgpu_memcg_avail_bytes();
+
+		if (avail != ULONG_MAX && avail < need + reserve) {
+			DRM_DEBUG_DRIVER(
+				"amdgpu_ttm: gtt cgroup gate reject avail=%luMB need=%luMB reserve=%uMB\n",
+				avail >> 20, need >> 20,
+				amdgpu_gtt_cgroup_reserve_mb);
+			return -ENOMEM;
+		}
+	}
 
 	if (adev->mman.ttm_pools && gtt->pool_id >= 0)
 		pool = &adev->mman.ttm_pools[gtt->pool_id];

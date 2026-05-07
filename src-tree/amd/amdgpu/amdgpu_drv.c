@@ -1014,7 +1014,23 @@ module_param_named(kfd_unpin_drain_ms, amdgpu_kfd_unpin_drain_ms, int, 0644);
 MODULE_PARM_DESC(kfd_unpin_drain_ms,
 	"Strict unpin drain timeout ms (0=legacy, default 3000)");
 
-
+/**
+ * DOC: gtt_cgroup_reserve_mb (uint) [V17.5 Phase A]
+ * Cgroup-aware GTT allocation gate. When non-zero, GTT page populate is
+ * rejected early with -ENOMEM if the calling process's cgroup memcg has
+ * less than (need + this) bytes available. This surfaces as
+ * hipErrorOutOfMemory in user-space instead of allowing the OOM-killer
+ * to take down the GPU service process. 0 = disabled (default).
+ *
+ * Recommended deployment: ops sets this per cgroup configuration. A
+ * conservative value of 4096 reserves 4GB of cgroup budget for non-GPU
+ * use, leaving the remainder for GTT. Values larger than the cgroup
+ * limit effectively disable GTT allocation through this driver.
+ */
+uint amdgpu_gtt_cgroup_reserve_mb;
+module_param_named(gtt_cgroup_reserve_mb, amdgpu_gtt_cgroup_reserve_mb, uint, 0644);
+MODULE_PARM_DESC(gtt_cgroup_reserve_mb,
+	"Reserve N MB of cgroup memcg budget when populating GTT (0=disabled, default 0)");
 
 /**
  * DOC: send_sigterm (int)
