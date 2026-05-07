@@ -24,6 +24,8 @@
 #include <linux/types.h>
 #include <linux/sched/task.h>
 #include <linux/dynamic_debug.h>
+#include <linux/mm.h>
+#include <linux/mmap_lock.h>
 #include <drm/ttm/ttm_tt.h>
 #include <drm/drm_exec.h>
 
@@ -62,6 +64,18 @@
  * power of 2MB.
  */
 static uint64_t max_svm_range_pages;
+
+/*
+ * V17.5 Phase C2: when MMU_NOTIFY_UNMAP fires for a range with active queue
+ * references but the user VMA is still present (i.e. reclaim/migration, not
+ * a real munmap), defer to the existing svm_range_evict() restore path
+ * instead of calling kgd2kfd_quiesce_mm() and permanently retiring the
+ * compute queue. Default ON; toggle to 0 to restore legacy behavior.
+ */
+int kfd_defer_queue_eviction = 1;
+module_param(kfd_defer_queue_eviction, int, 0644);
+MODULE_PARM_DESC(kfd_defer_queue_eviction,
+		 "Defer queue eviction when CWSR VMA is still mapped (default: 1)");
 
 struct criu_svm_metadata {
 	struct list_head list;
@@ -2493,12 +2507,48 @@ svm_range_unmap_from_cpu(struct mm_struct *mm, struct svm_range *prange,
 
 	if (atomic_read(&prange->queue_refcount)) {
 		int r;
+		bool defer = false;
 
-		pr_warn("Freeing queue vital buffer 0x%lx, queue evicted\n",
-			prange->start << PAGE_SHIFT);
-		r = kgd2kfd_quiesce_mm(mm, KFD_QUEUE_EVICTION_TRIGGER_SVM);
-		if (r)
-			pr_debug("failed %d to quiesce KFD queues\n", r);
+		/*
+		 * V17.5 Phase C2: if the user VMA covering this range is
+		 * still present, this notifier was triggered by reclaim,
+		 * migration, THP collapse, KSM, mremap, or similar — not
+		 * by a real munmap. Quiescing the queue in that case is
+		 * an over-reaction; route through svm_range_evict() so the
+		 * restore worker can re-validate pages on the next access.
+		 *
+		 * mmu_notifier UNMAP callbacks run with mmap_lock held.
+		 * If find_vma() returns a VMA that fully covers our range,
+		 * we know userspace is still keeping the mapping alive.
+		 */
+		if (kfd_defer_queue_eviction) {
+			unsigned long va_start = prange->start << PAGE_SHIFT;
+			unsigned long va_end =
+				(prange->last + 1) << PAGE_SHIFT;
+			struct vm_area_struct *vma;
+
+			mmap_assert_locked(mm);
+			vma = find_vma(mm, va_start);
+			if (vma && vma->vm_start <= va_start &&
+			    vma->vm_end >= va_end)
+				defer = true;
+		}
+
+		if (defer) {
+			pr_warn_ratelimited(
+				"kfd: deferring queue eviction for prange 0x%lx (VMA still present)\n",
+				prange->start << PAGE_SHIFT);
+			svm_range_evict(prange, mm,
+					prange->start, prange->last,
+					MMU_NOTIFY_UNMAP);
+		} else {
+			pr_warn("Freeing queue vital buffer 0x%lx, queue evicted\n",
+				prange->start << PAGE_SHIFT);
+			r = kgd2kfd_quiesce_mm(mm,
+					       KFD_QUEUE_EVICTION_TRIGGER_SVM);
+			if (r)
+				pr_debug("failed %d to quiesce KFD queues\n", r);
+		}
 	}
 
 	p = kfd_lookup_process_by_mm(mm);
