@@ -239,6 +239,14 @@ extern unsigned long kfd_pin_queue_svm_max_mb;
  */
 extern int kfd_defer_queue_eviction;
 
+/*
+ * V17.5 Phase C: bottom-guard helper used by svm_range_free() to recover
+ * from a leaked pin. Defined in kfd_queue.c.
+ */
+struct svm_range;
+void kfd_queue_unpin_svm_prange(struct kfd_process *p,
+				struct svm_range *prange);
+
 extern struct mutex kfd_processes_mutex;
 
 enum cache_policy {

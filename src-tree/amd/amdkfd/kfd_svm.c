@@ -289,6 +289,16 @@ static void svm_range_free(struct svm_range *prange, bool do_unmap)
 	pr_debug("svms 0x%p prange 0x%p [0x%lx 0x%lx]\n", prange->svms, prange,
 		 prange->start, prange->last);
 
+	/*
+	 * V17.5 Phase C bottom guard: a healthy lifecycle releases the pin
+	 * via kfd_queue_buffer_svm_put() when queue_refcount hits zero. If
+	 * we still see gup_pinned here, either the queue release path was
+	 * skipped or the prange was freed under us — recover by unpinning
+	 * to prevent a host-RAM leak.
+	 */
+	if (WARN_ON_ONCE(prange->gup_pinned))
+		kfd_queue_unpin_svm_prange(p, prange);
+
 	svm_range_vram_node_free(prange);
 	if (do_unmap)
 		svm_range_dma_unmap(prange);
@@ -1084,6 +1094,17 @@ svm_range_split_adjust(struct svm_range *new, struct svm_range *old,
 	bitmap_copy(new->bitmap_access, old->bitmap_access, MAX_GPU_INSTANCE);
 	bitmap_copy(new->bitmap_aip, old->bitmap_aip, MAX_GPU_INSTANCE);
 	atomic_set(&new->queue_refcount, atomic_read(&old->queue_refcount));
+
+	/*
+	 * V17.5 Phase C: pin tracking is owned by the original prange that
+	 * called pin_user_pages_remote(). The split sibling MUST NOT inherit
+	 * pinned_pages/gup_pinned — it would otherwise double-unpin on put.
+	 * The original prange retains the pin and will release it normally
+	 * via kfd_queue_buffer_svm_put() when its queue_refcount hits zero.
+	 */
+	new->pinned_pages = NULL;
+	new->pinned_npages = 0;
+	new->gup_pinned = false;
 
 	return 0;
 }
@@ -2028,6 +2049,11 @@ static struct svm_range *svm_range_clone(struct svm_range *old)
 	bitmap_copy(new->bitmap_access, old->bitmap_access, MAX_GPU_INSTANCE);
 	bitmap_copy(new->bitmap_aip, old->bitmap_aip, MAX_GPU_INSTANCE);
 	atomic_set(&new->queue_refcount, atomic_read(&old->queue_refcount));
+
+	/* V17.5 Phase C: see comment in svm_range_split_adjust(). */
+	new->pinned_pages = NULL;
+	new->pinned_npages = 0;
+	new->gup_pinned = false;
 
 	return new;
 }

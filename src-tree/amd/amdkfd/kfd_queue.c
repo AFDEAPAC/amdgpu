@@ -202,9 +202,13 @@ err_free:
 /*
  * Release the pin established by kfd_queue_pin_svm_prange(). Caller must
  * hold p->svms.lock and have observed prange->queue_refcount == 0.
+ *
+ * Exposed (non-static) so svm_range_free() can use it as a bottom guard
+ * to recover from a leaked pin (which should never happen, but if it
+ * does we must not leave pages pinned forever).
  */
-static void kfd_queue_unpin_svm_prange(struct kfd_process *p,
-				       struct svm_range *prange)
+void kfd_queue_unpin_svm_prange(struct kfd_process *p,
+				struct svm_range *prange)
 {
 	if (!prange->gup_pinned)
 		return;
