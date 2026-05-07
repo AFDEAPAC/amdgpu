@@ -239,14 +239,6 @@ extern unsigned long kfd_pin_queue_svm_max_mb;
  */
 extern int kfd_defer_queue_eviction;
 
-/*
- * V17.5 Phase C: bottom-guard helper used by svm_range_free() to recover
- * from a leaked pin. Defined in kfd_queue.c.
- */
-struct svm_range;
-void kfd_queue_unpin_svm_prange(struct kfd_process *p,
-				struct svm_range *prange);
-
 extern struct mutex kfd_processes_mutex;
 
 enum cache_policy {
@@ -1196,6 +1188,15 @@ struct kfd_process {
 	struct attribute attr_pinned_svm_bytes;
 	struct attribute attr_pinned_svm_ranges;
 };
+
+/*
+ * V17.5 Phase C: bottom-guard helper used by svm_range_free() to recover
+ * from a leaked pin. Defined in kfd_queue.c. Declared after struct
+ * kfd_process is complete so the prototype is unambiguous.
+ */
+struct svm_range;
+void kfd_queue_unpin_svm_prange(struct kfd_process *p,
+				struct svm_range *prange);
 
 #define KFD_PROCESS_TABLE_SIZE 5 /* bits: 32 entries */
 extern DECLARE_HASHTABLE(kfd_processes_table, KFD_PROCESS_TABLE_SIZE);
