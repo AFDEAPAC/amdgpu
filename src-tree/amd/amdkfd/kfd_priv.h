@@ -223,6 +223,22 @@ extern bool keep_idle_process_evicted;
 /* Enable eviction debug messages */
 extern bool debug_evictions;
 
+/*
+ * V17.5 Phase C: pin user-space CWSR SVM pages so kernel reclaim cannot
+ * trigger MMU_NOTIFY_UNMAP and quiesce the compute queue.
+ *   kfd_pin_queue_svm_pages   - master toggle (default: 1)
+ *   kfd_pin_queue_svm_max_mb  - per-process cap in MB (default: 256)
+ */
+extern int kfd_pin_queue_svm_pages;
+extern unsigned long kfd_pin_queue_svm_max_mb;
+
+/*
+ * V17.5 Phase C2: when MMU_NOTIFY_UNMAP fires for a CWSR range whose VMA
+ * is still present (i.e. reclaim/migration, not real munmap), defer
+ * eviction to the restore-worker path instead of immediate quiesce.
+ */
+extern int kfd_defer_queue_eviction;
+
 extern struct mutex kfd_processes_mutex;
 
 enum cache_policy {

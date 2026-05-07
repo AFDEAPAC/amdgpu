@@ -23,9 +23,36 @@
  */
 
 #include <linux/slab.h>
+#include <linux/mm.h>
+#include <linux/sched/mm.h>
+#include <linux/mmap_lock.h>
+#include <kcl/backport/kcl_mm_backport.h>
 #include "kfd_priv.h"
 #include "kfd_topology.h"
 #include "kfd_svm.h"
+
+/*
+ * V17.5 Phase C modparams.
+ *
+ * kfd_pin_queue_svm_pages:
+ *   When 1 (default), kfd_queue_buffer_svm_get() pins the user-space CWSR
+ *   pages with FOLL_LONGTERM so kernel direct reclaim cannot trigger
+ *   MMU_NOTIFY_UNMAP and consequently quiesce the compute queue.
+ *
+ * kfd_pin_queue_svm_max_mb:
+ *   Per-process aggregate cap. Once reached, additional queues are created
+ *   but their CWSR ranges remain unpinned (legacy behavior). Prevents a
+ *   misbehaving process from pinning unbounded host RAM.
+ */
+int kfd_pin_queue_svm_pages = 1;
+module_param(kfd_pin_queue_svm_pages, int, 0644);
+MODULE_PARM_DESC(kfd_pin_queue_svm_pages,
+		 "Pin user CWSR SVM pages to prevent reclaim-driven queue eviction (default: 1)");
+
+unsigned long kfd_pin_queue_svm_max_mb = 256;
+module_param(kfd_pin_queue_svm_max_mb, ulong, 0644);
+MODULE_PARM_DESC(kfd_pin_queue_svm_max_mb,
+		 "Per-process cap on pinned CWSR pages, in MB (default: 256)");
 
 void print_queue_properties(struct queue_properties *q)
 {
@@ -87,6 +114,112 @@ void uninit_queue(struct queue *q)
 
 #if IS_ENABLED(CONFIG_HSA_AMD_SVM_AMDKCL)
 
+/*
+ * V17.5 Phase C: defensive cap on a single prange pin to keep kvmalloc
+ * within sane bounds and avoid pinning oversized SVM ranges by accident.
+ * CWSR per queue per XCC is at most a few hundred KB; 16MB is well above
+ * the largest plausible total per prange.
+ */
+#define KFD_PIN_PRANGE_MAX_PAGES   (16ULL << (20 - PAGE_SHIFT))
+
+/*
+ * Pin the user-space pages backing the given SVM prange so kernel reclaim
+ * skips them. On success the prange owns the pin until queue_refcount hits
+ * zero and kfd_queue_unpin_svm_prange() releases it.
+ *
+ * Caller must hold p->svms.lock so the prange cannot be split or freed
+ * concurrently. Pin failure is non-fatal — the caller logs and continues
+ * with legacy behavior; queue creation must never be blocked by Phase C.
+ */
+static int kfd_queue_pin_svm_prange(struct kfd_process *p,
+				    struct svm_range *prange)
+{
+	unsigned long uaddr = prange->start << PAGE_SHIFT;
+	unsigned long npages = prange->last - prange->start + 1;
+	unsigned long want_bytes = npages << PAGE_SHIFT;
+	unsigned long cur_bytes, max_bytes;
+	struct mm_struct *mm;
+	struct page **pages;
+	long pinned;
+	int ret = 0;
+
+	if (npages == 0 || npages > KFD_PIN_PRANGE_MAX_PAGES) {
+		pr_warn_ratelimited("kfd: skip pin: prange size out of range (%lu pages)\n",
+				    npages);
+		return -E2BIG;
+	}
+
+	cur_bytes = atomic_long_read(&p->pinned_svm_bytes);
+	max_bytes = kfd_pin_queue_svm_max_mb << 20;
+	if (cur_bytes + want_bytes > max_bytes) {
+		pr_warn_ratelimited("kfd: pin SVM cap reached (cur=%luKB want=%luKB max=%luKB)\n",
+				    cur_bytes >> 10, want_bytes >> 10,
+				    max_bytes >> 10);
+		return -ENOMEM;
+	}
+
+	pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
+	if (!pages)
+		return -ENOMEM;
+
+	mm = get_task_mm(p->lead_thread);
+	if (!mm) {
+		ret = -ESRCH;
+		goto err_free;
+	}
+
+	mmap_read_lock(mm);
+	pinned = kcl_pin_user_pages_remote(mm, uaddr, npages,
+					   FOLL_WRITE | FOLL_LONGTERM,
+					   pages);
+	mmap_read_unlock(mm);
+	mmput(mm);
+
+	if (pinned < 0) {
+		ret = (int)pinned;
+		goto err_free;
+	}
+	if (pinned != (long)npages) {
+		pr_warn_ratelimited("kfd: partial pin %ld/%lu for prange [0x%lx-0x%lx]\n",
+				    pinned, npages, prange->start, prange->last);
+		kcl_unpin_user_pages(pages, pinned);
+		ret = -EAGAIN;
+		goto err_free;
+	}
+
+	prange->pinned_pages = pages;
+	prange->pinned_npages = npages;
+	prange->gup_pinned = true;
+	atomic_long_add(want_bytes, &p->pinned_svm_bytes);
+	atomic_inc(&p->pinned_svm_ranges);
+	return 0;
+
+err_free:
+	kvfree(pages);
+	return ret;
+}
+
+/*
+ * Release the pin established by kfd_queue_pin_svm_prange(). Caller must
+ * hold p->svms.lock and have observed prange->queue_refcount == 0.
+ */
+static void kfd_queue_unpin_svm_prange(struct kfd_process *p,
+				       struct svm_range *prange)
+{
+	if (!prange->gup_pinned)
+		return;
+
+	kcl_unpin_user_pages(prange->pinned_pages, prange->pinned_npages);
+	atomic_long_sub(prange->pinned_npages << PAGE_SHIFT,
+			&p->pinned_svm_bytes);
+	atomic_dec(&p->pinned_svm_ranges);
+
+	kvfree(prange->pinned_pages);
+	prange->pinned_pages = NULL;
+	prange->pinned_npages = 0;
+	prange->gup_pinned = false;
+}
+
 static int kfd_queue_buffer_svm_get(struct kfd_process_device *pdd, u64 addr, u64 size)
 {
 	struct kfd_process *p = pdd->process;
@@ -139,8 +272,27 @@ static int kfd_queue_buffer_svm_get(struct kfd_process_device *pdd, u64 addr, u6
 		goto out_unlock;
 	}
 
-	list_for_each_entry(prange, &update_list, update_list)
+	list_for_each_entry(prange, &update_list, update_list) {
 		atomic_inc(&prange->queue_refcount);
+
+		/*
+		 * V17.5 Phase C: pin user CWSR pages so kernel reclaim
+		 * cannot trigger MMU_NOTIFY_UNMAP -> queue eviction.
+		 *
+		 * Pin failure is non-fatal: queue creation must not depend
+		 * on this optimization. We log once at WARN level then fall
+		 * back to legacy behavior (range may still be evicted under
+		 * memory pressure, but service-survival ENV will keep the
+		 * user-space wait bounded).
+		 */
+		if (kfd_pin_queue_svm_pages && !prange->gup_pinned) {
+			int pin_ret = kfd_queue_pin_svm_prange(p, prange);
+
+			if (pin_ret)
+				pr_warn_ratelimited("kfd: phase-C pin failed prange %p ret=%d (legacy fallback)\n",
+						    prange, pin_ret);
+		}
+	}
 	ret = 0;
 
 out_unlock:
@@ -172,6 +324,17 @@ static void kfd_queue_buffer_svm_put(struct kfd_process_device *pdd, u64 addr, u
 		if (atomic_add_unless(&prange->queue_refcount, -1, 0)) {
 			list_for_each_entry(pchild, &prange->child_list, child_list)
 				atomic_add_unless(&pchild->queue_refcount, -1, 0);
+
+			/*
+			 * V17.5 Phase C: drop the pin only when the last
+			 * queue using this prange goes away. Multiple
+			 * concurrent queues sharing a prange share a single
+			 * pin; the gup_pinned flag prevents double-pin in
+			 * kfd_queue_buffer_svm_get().
+			 */
+			if (atomic_read(&prange->queue_refcount) == 0 &&
+			    prange->gup_pinned)
+				kfd_queue_unpin_svm_prange(p, prange);
 		}
 
 		node = next_node;
