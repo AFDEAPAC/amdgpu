@@ -334,7 +334,17 @@ static ssize_t kfd_procfs_show(struct kobject *kobj, struct attribute *attr,
 {
 	if (strcmp(attr->name, "pasid") == 0)
 		return snprintf(buffer, PAGE_SIZE, "%d\n", 0);
-	else if (strncmp(attr->name, "vram_", 5) == 0) {
+	else if (strcmp(attr->name, "pinned_svm_bytes") == 0) {
+		struct kfd_process *p = container_of(attr, struct kfd_process,
+						     attr_pinned_svm_bytes);
+		return snprintf(buffer, PAGE_SIZE, "%lu\n",
+				atomic_long_read(&p->pinned_svm_bytes));
+	} else if (strcmp(attr->name, "pinned_svm_ranges") == 0) {
+		struct kfd_process *p = container_of(attr, struct kfd_process,
+						     attr_pinned_svm_ranges);
+		return snprintf(buffer, PAGE_SIZE, "%d\n",
+				atomic_read(&p->pinned_svm_ranges));
+	} else if (strncmp(attr->name, "vram_", 5) == 0) {
 		struct kfd_process_device *pdd = container_of(attr, struct kfd_process_device,
 							      attr_vram);
 		return snprintf(buffer, PAGE_SIZE, "%llu\n", atomic64_read(&pdd->vram_usage));
@@ -879,6 +889,14 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
 		kfd_sysfs_create_file(process->kobj, &process->attr_pasid,
 				      "pasid");
 
+		/* V17.5 Phase C visibility */
+		kfd_sysfs_create_file(process->kobj,
+				      &process->attr_pinned_svm_bytes,
+				      "pinned_svm_bytes");
+		kfd_sysfs_create_file(process->kobj,
+				      &process->attr_pinned_svm_ranges,
+				      "pinned_svm_ranges");
+
 		process->kobj_queues = kobject_create_and_add("queues",
 							process->kobj);
 		if (!process->kobj_queues)
@@ -1107,6 +1125,9 @@ static void kfd_process_remove_sysfs(struct kfd_process *p)
 		return;
 
 	sysfs_remove_file(p->kobj, &p->attr_pasid);
+	/* V17.5 Phase C visibility */
+	sysfs_remove_file(p->kobj, &p->attr_pinned_svm_bytes);
+	sysfs_remove_file(p->kobj, &p->attr_pinned_svm_ranges);
 	kobject_del(p->kobj_queues);
 	kobject_put(p->kobj_queues);
 	p->kobj_queues = NULL;

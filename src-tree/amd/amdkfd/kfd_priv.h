@@ -1193,6 +1193,8 @@ struct kfd_process {
 	 */
 	atomic_long_t pinned_svm_bytes;
 	atomic_t pinned_svm_ranges;
+	struct attribute attr_pinned_svm_bytes;
+	struct attribute attr_pinned_svm_ranges;
 };
 
 #define KFD_PROCESS_TABLE_SIZE 5 /* bits: 32 entries */
