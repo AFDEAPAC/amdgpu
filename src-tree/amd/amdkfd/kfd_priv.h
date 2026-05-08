@@ -642,6 +642,28 @@ struct queue_properties {
 	struct amdgpu_bo *ring_bo;
 	struct amdgpu_bo *eop_buf_bo;
 	struct amdgpu_bo *cwsr_bo;
+
+	/*
+	 * V17.5 Item 1 (cwsr-resilient): driver-allocated VRAM CWSR.
+	 *
+	 * When the queue was created with KFD_IOC_QUEUE_FLAGS_USE_DRIVER_CWSR
+	 * granted, kfd_alloc_cwsr_vram() populates these fields. The CWSR
+	 * area lives in VRAM (cgroup-immune), is mapped into the process
+	 * GPUVM at ctx_save_restore_area_address, and (after Item 1 e/5)
+	 * is also mmap'd into the process's user mm at user_va so the
+	 * thunk can fill_cwsr_header() once at queue creation time.
+	 *
+	 * cwsr_drv_owned is the single source of truth for "this queue's
+	 * CWSR is driver-managed" — every code path that today consumes
+	 * ctx_save_restore_area_address (MQD prep, SVM range get/put,
+	 * destroy, debugger) must check this flag.
+	 */
+	struct kgd_mem		*cwsr_drv_mem;
+	int			cwsr_drv_idr_handle;
+	struct dma_buf		*cwsr_drv_dmabuf;
+	uint64_t		cwsr_drv_user_va;
+	uint64_t		cwsr_drv_mmap_offset;
+	bool			cwsr_drv_owned;
 };
 
 #define QUEUE_IS_ACTIVE(q) ((q).queue_size > 0 &&	\
@@ -1222,6 +1244,18 @@ void kfd_queue_unpin_svm_prange(struct kfd_process *p,
  */
 void kfd_queue_unlock_vma_for_prange(struct kfd_process *p,
 				     struct svm_range *prange);
+
+/*
+ * V17.5 Item 1 (cwsr-resilient): driver-allocated VRAM CWSR helpers.
+ * Defined in kfd_queue.c. Use only when (a) kfd_cwsr_in_vram=1 AND
+ * (b) userspace set KFD_IOC_QUEUE_FLAGS_USE_DRIVER_CWSR. Failure here
+ * is fatal at the caller — we do NOT silently fall back to host CWSR.
+ */
+struct queue_properties;
+int kfd_alloc_cwsr_vram(struct kfd_process_device *pdd, uint64_t gpu_va,
+			size_t size, struct queue_properties *q_props);
+void kfd_free_cwsr_vram(struct kfd_process_device *pdd,
+			struct queue_properties *q_props);
 
 #define KFD_PROCESS_TABLE_SIZE 5 /* bits: 32 entries */
 extern DECLARE_HASHTABLE(kfd_processes_table, KFD_PROCESS_TABLE_SIZE);

@@ -26,6 +26,7 @@
 #include <linux/mm.h>
 #include <linux/sched/mm.h>
 #include <linux/mmap_lock.h>
+#include <linux/dma-buf.h>
 #include <kcl/backport/kcl_mm_backport.h>
 #include "kfd_priv.h"
 #include "kfd_topology.h"
@@ -582,6 +583,156 @@ static void kfd_queue_buffer_svm_put(struct kfd_process_device *pdd, u64 addr, u
 }
 
 #endif
+
+/*
+ * V17.5 Item 1 (cwsr-resilient): driver-allocated VRAM CWSR helpers.
+ *
+ * These wrap the existing KFD GPUVM allocator with the parameters
+ * appropriate for context-save-restore: VRAM-domain, host-visible
+ * (PUBLIC), wiped on release. The thunk supplies the GPU virtual
+ * address (drawn from its own per-process aperture, same way it does
+ * for any other queue resource); the driver allocates the VRAM BO,
+ * reserves cgroup VRAM via the existing KFD path, and maps the BO into
+ * the process GPUVM at exactly that address so HW can write CWSR
+ * data without any further translation.
+ *
+ * The dma_buf export and user-VA mmap are layered on top in Item 1
+ * e/5 (so userspace's fill_cwsr_header pass can write the header).
+ *
+ * Failure here is fatal at the call site: when userspace explicitly
+ * requested USE_DRIVER_CWSR and the modparam permits it, we either
+ * give them a working driver-CWSR queue or fail with -ENOMEM. We do
+ * NOT silently fall back to legacy host CWSR — that would defeat the
+ * whole point of the feature (which is to escape cgroup pressure).
+ * Old userspace simply doesn't set the flag and never enters this
+ * path, so they retain the legacy fallback.
+ */
+int kfd_alloc_cwsr_vram(struct kfd_process_device *pdd, uint64_t gpu_va,
+			size_t size, struct queue_properties *q_props)
+{
+	struct kfd_process *p = pdd->process;
+	struct kgd_mem *mem = NULL;
+	uint64_t mmap_offset = 0;
+	uint32_t flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM |
+			 KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC |
+			 KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE |
+			 KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
+			 KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE;
+	int idr_handle = -1;
+	int ret;
+
+	if (!kfd_cwsr_in_vram)
+		return -EOPNOTSUPP;
+	if (!q_props || !pdd || !pdd->dev || !pdd->drm_priv)
+		return -EINVAL;
+	if (!size || (size & (PAGE_SIZE - 1)) || (gpu_va & (PAGE_SIZE - 1)))
+		return -EINVAL;
+
+	if (!kfd_dev_is_large_bar(pdd->dev)) {
+		pr_warn_ratelimited("kfd: item-1 cwsr-vram requires large-bar; declining\n");
+		return -EOPNOTSUPP;
+	}
+
+	ret = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
+			pdd->dev->adev, gpu_va, size,
+			pdd->drm_priv, &mem, &mmap_offset, flags, false);
+	if (ret) {
+		pr_warn_ratelimited("kfd: item-1 cwsr-vram alloc failed gpu_va=0x%llx size=0x%zx ret=%d\n",
+				    gpu_va, size, ret);
+		return ret;
+	}
+
+	idr_handle = kfd_process_device_create_obj_handle(pdd, mem,
+				gpu_va, size, 0,
+				KFD_IOC_ALLOC_MEM_FLAGS_VRAM, -1);
+	if (idr_handle < 0) {
+		ret = -EFAULT;
+		goto err_free_mem;
+	}
+
+	ret = amdgpu_amdkfd_gpuvm_map_memory_to_gpu(pdd->dev->adev, mem,
+						    pdd->drm_priv);
+	if (ret) {
+		pr_warn_ratelimited("kfd: item-1 cwsr-vram map_to_gpu failed gpu_va=0x%llx ret=%d\n",
+				    gpu_va, ret);
+		goto err_free_handle;
+	}
+
+	atomic64_add(PAGE_ALIGN(size), &pdd->vram_usage);
+
+	q_props->cwsr_drv_mem = mem;
+	q_props->cwsr_drv_idr_handle = idr_handle;
+	q_props->cwsr_drv_dmabuf = NULL;	/* exported in Item 1 e/5 */
+	q_props->cwsr_drv_user_va = 0;		/* mmap'd in Item 1 e/5 */
+	q_props->cwsr_drv_mmap_offset = mmap_offset;
+	q_props->cwsr_drv_owned = true;
+	q_props->ctx_save_restore_area_address = gpu_va;
+	q_props->ctx_save_restore_area_size = size;
+
+	pr_debug("kfd: item-1 cwsr-vram allocated gpu_va=0x%llx size=0x%zx mmap_off=0x%llx\n",
+		 gpu_va, size, mmap_offset);
+	return 0;
+
+err_free_handle:
+	kfd_process_device_remove_obj_handle(pdd, idr_handle);
+err_free_mem:
+	amdgpu_amdkfd_gpuvm_free_memory_of_gpu(pdd->dev->adev, mem,
+					       pdd->drm_priv, NULL);
+	(void)p;	/* reserved for future use (counters / tracing) */
+	return ret;
+}
+
+/*
+ * Mirror of kfd_alloc_cwsr_vram. Releases the VRAM BO, removes it from
+ * the process kgd_mem table, and zeros the queue_properties bookkeeping.
+ *
+ * Idempotent: safe to call when q_props->cwsr_drv_owned is false (no-op).
+ * Also safe to call when amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu would
+ * fail (we follow the existing error-tolerant teardown convention used
+ * by the regular alloc-memory ioctl release path).
+ */
+void kfd_free_cwsr_vram(struct kfd_process_device *pdd,
+			struct queue_properties *q_props)
+{
+	struct kgd_mem *mem;
+	uint64_t size = 0;
+
+	if (!q_props || !q_props->cwsr_drv_owned)
+		return;
+
+	mem = q_props->cwsr_drv_mem;
+	if (!mem || !pdd || !pdd->dev)
+		goto clear_props;
+
+	(void)amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(pdd->dev->adev, mem,
+							pdd->drm_priv);
+
+	/*
+	 * Free returns the BO size in 'size' so we can keep the per-pdd
+	 * vram_usage counter honest. Mirrors the existing free path in
+	 * kfd_chardev.c::kfd_ioctl_free_memory_of_gpu.
+	 */
+	(void)amdgpu_amdkfd_gpuvm_free_memory_of_gpu(pdd->dev->adev, mem,
+						     pdd->drm_priv, &size);
+
+	if (q_props->cwsr_drv_idr_handle >= 0)
+		kfd_process_device_remove_obj_handle(pdd,
+				q_props->cwsr_drv_idr_handle);
+
+	if (size)
+		atomic64_sub(PAGE_ALIGN(size), &pdd->vram_usage);
+
+clear_props:
+	if (q_props->cwsr_drv_dmabuf) {
+		dma_buf_put(q_props->cwsr_drv_dmabuf);
+		q_props->cwsr_drv_dmabuf = NULL;
+	}
+	q_props->cwsr_drv_mem = NULL;
+	q_props->cwsr_drv_idr_handle = -1;
+	q_props->cwsr_drv_user_va = 0;
+	q_props->cwsr_drv_mmap_offset = 0;
+	q_props->cwsr_drv_owned = false;
+}
 
 int kfd_queue_buffer_get(struct amdgpu_vm *vm, void __user *addr, struct amdgpu_bo **pbo,
 			 u64 expected_size)
