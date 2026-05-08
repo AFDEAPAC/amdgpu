@@ -239,6 +239,14 @@ extern unsigned long kfd_pin_queue_svm_max_mb;
  */
 extern int kfd_defer_queue_eviction;
 
+/*
+ * V17.5 Item 2 (cwsr-resilient): VMA-level CWSR protection.
+ * Set VM_LOCKED on the user VMAs backing CWSR ranges so kernel reclaim
+ * skips them. Replaces the disabled Phase C (FOLL_LONGTERM pin) path.
+ * Default 1.
+ */
+extern int kfd_protect_cwsr_vma;
+
 extern struct mutex kfd_processes_mutex;
 
 enum cache_policy {

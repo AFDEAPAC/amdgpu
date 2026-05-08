@@ -54,6 +54,29 @@ module_param(kfd_pin_queue_svm_max_mb, ulong, 0644);
 MODULE_PARM_DESC(kfd_pin_queue_svm_max_mb,
 		 "Per-process cap on pinned CWSR pages, in MB (default: 256)");
 
+/*
+ * V17.5 Item 2 (cwsr-resilient): VMA-level CWSR protection.
+ *
+ * When 1 (default), kfd_queue_buffer_svm_get() sets VM_LOCKED|VM_DONTCOPY on
+ * the VMAs backing the CWSR / queue-vital SVM ranges, preventing kernel
+ * direct reclaim from picking those pages. This is the safe replacement for
+ * Phase C (kfd_pin_queue_svm_pages) which used pin_user_pages_remote with
+ * FOLL_LONGTERM and triggered svm_migrate_to_ram D-state on
+ * GPU_ALWAYS_MAPPED ranges. VM_LOCKED uses the same kernel primitive as
+ * userspace mlock(2) and never triggers the SVM migration path.
+ *
+ * Coexistence: when kfd_cwsr_in_vram=1 (Item 1), the CWSR range is owned by
+ * a VRAM BO and there are no user pages to lock — Item 2 path is a no-op
+ * for that range.
+ *
+ * Set to 0 to disable (legacy reclaim-driven eviction reappears, mitigated
+ * only by Phase C2 defer-on-unmap).
+ */
+int kfd_protect_cwsr_vma = 1;
+module_param(kfd_protect_cwsr_vma, int, 0644);
+MODULE_PARM_DESC(kfd_protect_cwsr_vma,
+		 "Set VM_LOCKED on CWSR/queue-vital VMAs to prevent reclaim (default: 1)");
+
 void print_queue_properties(struct queue_properties *q)
 {
 	if (!q)
