@@ -313,6 +313,16 @@ static void svm_range_free(struct svm_range *prange, bool do_unmap)
 	if (WARN_ON_ONCE(prange->gup_pinned))
 		kfd_queue_unpin_svm_prange(p, prange);
 
+	/*
+	 * V17.5 Item 2 (cwsr-resilient) bottom guard: same shape as the
+	 * Phase C guard but for the VMA-level lock. If healthy lifecycle
+	 * dropped to put() while queue_refcount==0, the lock is gone and
+	 * this is a no-op. Otherwise we must clear VM_LOCKED before the mm
+	 * is torn down so we don't leave reclaim-immune pages behind.
+	 */
+	if (WARN_ON_ONCE(prange->vma_locked))
+		kfd_queue_unlock_vma_for_prange(p, prange);
+
 	svm_range_vram_node_free(prange);
 	if (do_unmap)
 		svm_range_dma_unmap(prange);

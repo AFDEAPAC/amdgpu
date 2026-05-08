@@ -451,6 +451,34 @@ static int kfd_queue_buffer_svm_get(struct kfd_process_device *pdd, u64 addr, u6
 				pr_warn_ratelimited("kfd: phase-C pin failed prange %p ret=%d (legacy fallback)\n",
 						    prange, pin_ret);
 		}
+
+		/*
+		 * V17.5 Item 2 (cwsr-resilient): VMA-level CWSR protection.
+		 *
+		 * Set VM_LOCKED|VM_DONTCOPY on the user VMAs backing this
+		 * prange. This is the safe replacement for Phase C — it
+		 * uses the same mechanism as userspace mlock(2) and never
+		 * triggers svm_migrate_to_ram on GPU_ALWAYS_MAPPED ranges.
+		 *
+		 * Skipped if Phase C already took the pin (gup_pinned) so
+		 * we don't double-bookkeep pinned_svm_bytes. When Item 1
+		 * (kfd_cwsr_in_vram) lands and the CWSR range is owned by
+		 * a driver-allocated VRAM BO, kfd_queue_buffer_svm_get
+		 * will not be invoked for that range at all (Item 1 d/5),
+		 * so this branch never runs in that mode.
+		 *
+		 * Failure is non-fatal — queue creation must not be blocked
+		 * by this optimization.
+		 */
+		if (kfd_protect_cwsr_vma && !prange->gup_pinned &&
+		    !prange->vma_locked) {
+			int lock_ret = kfd_queue_lock_vma_for_prange(p,
+								     prange);
+
+			if (lock_ret)
+				pr_warn_ratelimited("kfd: item-2 vma-lock failed prange %p ret=%d (legacy fallback)\n",
+						    prange, lock_ret);
+		}
 	}
 	ret = 0;
 
@@ -494,6 +522,18 @@ static void kfd_queue_buffer_svm_put(struct kfd_process_device *pdd, u64 addr, u
 			if (atomic_read(&prange->queue_refcount) == 0 &&
 			    prange->gup_pinned)
 				kfd_queue_unpin_svm_prange(p, prange);
+
+			/*
+			 * V17.5 Item 2 (cwsr-resilient): mirror — drop the
+			 * VMA-level lock only when the last queue using this
+			 * prange goes away. Independent from Phase C: a prange
+			 * can be in either mode (gup_pinned XOR vma_locked)
+			 * but never both at once (the get() path enforces
+			 * the precedence).
+			 */
+			if (atomic_read(&prange->queue_refcount) == 0 &&
+			    prange->vma_locked)
+				kfd_queue_unlock_vma_for_prange(p, prange);
 		}
 
 		node = next_node;
