@@ -373,6 +373,47 @@ export HSA_CWSR_IN_VRAM=auto    # use VRAM if driver capable; falls back if not
 Run on alibabaHang `mi300x@10.95.37.64` or `mi308x@10.170.168.4`.
 Hardware reboot required to load the new modules.
 
+### 7.0 Customer-language metric: "GPU 卡在 100%"
+
+The single most actionable end-to-end metric is **whether any GPU sticks
+at 100% utilization permanently**. This is exactly what the customer
+reported and is independent of dmesg-grep heuristics:
+
+* When a queue is evicted by mm reclaim (the failure mode Item 2 closes),
+  userspace keeps submitting AQL packets to a queue the driver has torn
+  down. `/sys/class/drm/cardN/device/gpu_busy_percent` sticks at 100%
+  while the GFX activity counter (rocm-smi `--showuse` "GFX Activity")
+  stops advancing.
+* Healthy busy/idle cycle (Item 2 active, no eviction): util oscillates
+  with the workload; even at sustained ≥99% the activity counter
+  advances by hundreds of thousands per second.
+* The combination "util ≥ 99% for ≥30s **AND** activity counter delta
+  during the same window < `ACTIVITY_MIN_DELTA`" is the smoking gun.
+
+Use [`verify_gpu_util_stuck.sh`](verify_gpu_util_stuck.sh) (shipped in
+this directory) to enforce the metric automatically:
+
+```bash
+# baseline (v17.5-cgroup-aware): expect at least one GPU flagged stuck
+TAG=baseline TOTAL_DURATION_SEC=900 \
+  bash delivery/v17.5-cwsr-resilient/verify_gpu_util_stuck.sh &
+( cd reproducers/multistream_combo && \
+  MEM_LIMIT=32G N_STREAMS=16 bash run_cgroup32.sh )
+wait
+
+# after rebuild + module reload (v17.5-cwsr-resilient, Item 2 ON):
+# expect 0 GPUs flagged stuck
+TAG=cwsr_resilient TOTAL_DURATION_SEC=900 \
+  bash delivery/v17.5-cwsr-resilient/verify_gpu_util_stuck.sh &
+( cd reproducers/multistream_combo && \
+  MEM_LIMIT=32G N_STREAMS=16 bash run_cgroup32.sh )
+wait
+```
+
+Verdict file `runs/util_<TAG>/verdict.json` contains, per GPU,
+`longest_high_util_sec`, `activity_counter_delta_in_window`, and
+`PASS` / `STUCK_AT_100`. Exit code is 0 iff every GPU is `PASS`.
+
 ### 7.1 Item 2 only (default config)
 
 1. `dmesg -C; rmmod amdgpu; modprobe amdgpu`.
@@ -383,11 +424,15 @@ Hardware reboot required to load the new modules.
    - `cat /sys/class/kfd/kfd/proc/$(pgrep -f torch_service_sim)/pinned_svm_ranges`
      should match the number of active queues × num_xcc.
 4. Run customer reproducer + `madvise(MADV_DONTNEED)` jammer for 10
-   minutes. `dmesg | grep -c "Freeing queue vital buffer"` must be `0`.
+   minutes. **Two pass criteria**:
+   - `dmesg | grep -c "Freeing queue vital buffer"` must be `0`.
+   - `verify_gpu_util_stuck.sh` (run in parallel) must exit 0 — no GPU
+     flagged `STUCK_AT_100`.
 5. Regression — run gold-set `customer_hang_repro`,
    `multistream_combo`, `sdma_suballoc_hang`. Compare D-state and
    SIGABRT counts vs the `v17.5-cgroup-aware` baseline; must be ≤
-   baseline.
+   baseline. Also run `verify_gpu_util_stuck.sh` over the same window
+   and confirm verdict has fewer GPUs flagged than baseline (target: 0).
 6. Process-exit cleanup: SIGKILL the test, verify
    `pinned_svm_ranges == 0` and no `WARN: queue still locked at free`
    in dmesg.
@@ -402,7 +447,8 @@ Hardware reboot required to load the new modules.
    range backed by `[anon] DRM-prime` or similar (NOT plain anon).
 5. `dmesg | grep -i "item-1\|Freeing queue vital"` — Item 1 should log
    `kfd item-1: driver CWSR alloc gpu_va=...` once per queue and zero
-   `Freeing queue vital buffer`.
+   `Freeing queue vital buffer`. Run `verify_gpu_util_stuck.sh` in
+   parallel: must exit 0 (no GPU stuck at 100%).
 6. `HSA_CWSR_IN_VRAM=1 ...` with `kfd_cwsr_in_vram=0` should fail loudly
    (queue create returns error in user log). This validates the
    "no silent fallback" semantics.
@@ -416,7 +462,8 @@ Hardware reboot required to load the new modules.
 
 Same as 7.2 with `kfd_protect_cwsr_vma=1` (default). Item 2 path must
 self-disable on driver-owned CWSR (no SVM prange to lock); confirm via
-`pinned_svm_ranges` not bumping for the driver-CWSR queues.
+`pinned_svm_ranges` not bumping for the driver-CWSR queues. Same pass
+criterion: `verify_gpu_util_stuck.sh` exits 0.
 
 ### 7.4 Backward compat
 
