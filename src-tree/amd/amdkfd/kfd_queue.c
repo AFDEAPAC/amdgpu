@@ -339,16 +339,17 @@ static int kfd_queue_lock_vma_for_prange(struct kfd_process *p,
 	mmap_write_unlock(mm);
 
 	/*
-	 * Materialize the lock. mm_populate faults pages in and pins them
-	 * onto the unevictable LRU. Done outside mmap_write_lock because
-	 * mm_populate takes mmap_read_lock internally.
-	 *
-	 * Errors are advisory only — VM_LOCKED is set, so reclaim still
-	 * skips these pages on demand even if they're not all populated.
+	 * VM_LOCKED is set; we deliberately do NOT call mm_populate() here:
+	 *   - Older kernels (<= 5.10) do not export __mm_populate(), and a
+	 *     module-side call fails to link.
+	 *   - The pages are faulted in shortly afterwards anyway (queue
+	 *     creation reads/writes the CWSR header on the user VA), at
+	 *     which point VM_LOCKED routes them onto the unevictable LRU.
+	 *   - Reclaim already honors VM_LOCKED on a per-vma basis even
+	 *     before pages are actually faulted in, so the protection
+	 *     window is intact.
 	 */
-	if (any_locked)
-		mm_populate(uaddr, size);
-	else
+	if (!any_locked)
 		ret = -ENOENT;
 
 	mmput(mm);

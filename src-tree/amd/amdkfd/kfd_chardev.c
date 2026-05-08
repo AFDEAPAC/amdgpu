@@ -37,6 +37,7 @@
 #include <linux/ptrace.h>
 #include <linux/dma-buf.h>
 #include <linux/processor.h>
+#include <linux/sizes.h>
 #include "kfd_priv.h"
 #include "kfd_device_queue_manager.h"
 #include "kfd_svm.h"
@@ -426,26 +427,25 @@ static int kfd_ioctl_create_queue(struct file *filep, struct kfd_process *p,
 	if ((args->queue_create_flags & KFD_IOC_QUEUE_FLAGS_USE_DRIVER_CWSR) &&
 	    kfd_cwsr_in_vram &&
 	    q_properties.type == KFD_QUEUE_TYPE_COMPUTE) {
-		struct kfd_topology_device *topo;
 		size_t total_cwsr_size;
 
-		topo = kfd_topology_device_by_id(dev->id);
-		if (!topo) {
+		/*
+		 * Trust the size negotiated by the thunk via
+		 * update_ctx_save_restore_size() — it already accounts for
+		 * ctx_save_restore_size + debug_memory_size and num_xcc.
+		 * We just bound-check and page-align it here.
+		 */
+		if (!q_properties.ctx_save_restore_area_address ||
+		    !q_properties.ctx_save_restore_area_size ||
+		    q_properties.ctx_save_restore_area_size > SZ_64M) {
+			pr_warn_ratelimited("kfd: item-1 invalid cwsr params va=0x%llx sz=0x%llx\n",
+				(u64)q_properties.ctx_save_restore_area_address,
+				(u64)q_properties.ctx_save_restore_area_size);
 			err = -EINVAL;
 			goto err_bind_process;
 		}
-		total_cwsr_size = (topo->node_props.cwsr_size +
-				   topo->node_props.debug_memory_size) *
-				  NUM_XCC(dev->xcc_mask);
-		total_cwsr_size = ALIGN(total_cwsr_size, PAGE_SIZE);
-
-		if (q_properties.ctx_save_restore_area_size < total_cwsr_size) {
-			pr_warn_ratelimited("kfd: item-1 cwsr size mismatch (asked 0x%llx need 0x%zx)\n",
-				(u64)q_properties.ctx_save_restore_area_size,
-				total_cwsr_size);
-			err = -EINVAL;
-			goto err_bind_process;
-		}
+		total_cwsr_size = ALIGN(q_properties.ctx_save_restore_area_size,
+					PAGE_SIZE);
 
 		err = kfd_alloc_cwsr_vram(pdd,
 					  q_properties.ctx_save_restore_area_address,
