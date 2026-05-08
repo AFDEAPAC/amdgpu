@@ -897,6 +897,16 @@ int kfd_queue_release_buffers(struct kfd_process_device *pdd, struct queue_prope
 			  * NUM_XCC(pdd->dev->xcc_mask);
 	total_cwsr_size = ALIGN(total_cwsr_size, PAGE_SIZE);
 
+	/*
+	 * V17.5 Item 1 (cwsr-resilient): if this queue's CWSR is owned
+	 * by the driver (Item 1 path), free the VRAM BO + GPUVM mapping
+	 * here, mirroring kfd_alloc_cwsr_vram. The legacy SVM-put path
+	 * below is a no-op in that mode (Item 1 d/5 ensures the
+	 * acquire-side never registered an SVM range for this CWSR).
+	 */
+	if (properties->cwsr_drv_owned)
+		kfd_free_cwsr_vram(pdd, properties);
+
 	kfd_queue_buffer_svm_put(pdd, properties->ctx_save_restore_area_address, total_cwsr_size);
 	return 0;
 }

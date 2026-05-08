@@ -269,6 +269,14 @@ static int set_queue_properties_from_user(struct queue_properties *q_properties,
 	q_properties->ctx_save_restore_area_size = args->ctx_save_restore_size;
 	q_properties->ctl_stack_size = args->ctl_stack_size;
 	q_properties->sdma_engine_id = args->sdma_engine_id;
+
+	/*
+	 * V17.5 Item 1 (cwsr-resilient): driver-CWSR fields are reset by
+	 * the memset(&q_properties, 0, ...) at the start of the ioctl
+	 * handler. cwsr_drv_idr_handle is a real IDR slot value (>=0); we
+	 * use -1 as the "no slot held" sentinel, so initialize it here.
+	 */
+	q_properties->cwsr_drv_idr_handle = -1;
 	if (args->queue_type == KFD_IOC_QUEUE_TYPE_COMPUTE ||
 		args->queue_type == KFD_IOC_QUEUE_TYPE_COMPUTE_AQL)
 		q_properties->type = KFD_QUEUE_TYPE_COMPUTE;
@@ -393,6 +401,76 @@ static int kfd_ioctl_create_queue(struct file *filep, struct kfd_process *p,
 		}
 	}
 
+	/*
+	 * V17.5 Item 1 (cwsr-resilient): driver-allocated VRAM CWSR.
+	 *
+	 * Reject unknown / reserved bits in queue_create_flags so future
+	 * additions are guaranteed to fail-closed on old drivers.
+	 */
+	if (args->queue_create_flags & ~KFD_IOC_QUEUE_FLAGS_VALID_MASK) {
+		pr_debug("queue_create_flags has reserved bits set: 0x%x\n",
+			 args->queue_create_flags);
+		err = -EINVAL;
+		goto err_bind_process;
+	}
+
+	/*
+	 * If userspace requested driver-CWSR AND the modparam permits it,
+	 * allocate the VRAM BO and write the granted GPU VA back into the
+	 * args struct (and into q_properties) BEFORE acquire_buffers runs.
+	 * Item 1 d/5 will teach acquire_buffers to skip the SVM-get path
+	 * when q_properties.cwsr_drv_owned is true.
+	 *
+	 * Compute queues only — SDMA queues do not have CWSR.
+	 */
+	if ((args->queue_create_flags & KFD_IOC_QUEUE_FLAGS_USE_DRIVER_CWSR) &&
+	    kfd_cwsr_in_vram &&
+	    q_properties.type == KFD_QUEUE_TYPE_COMPUTE) {
+		struct kfd_topology_device *topo;
+		size_t total_cwsr_size;
+
+		topo = kfd_topology_device_by_id(dev->id);
+		if (!topo) {
+			err = -EINVAL;
+			goto err_bind_process;
+		}
+		total_cwsr_size = (topo->node_props.cwsr_size +
+				   topo->node_props.debug_memory_size) *
+				  NUM_XCC(dev->xcc_mask);
+		total_cwsr_size = ALIGN(total_cwsr_size, PAGE_SIZE);
+
+		if (q_properties.ctx_save_restore_area_size < total_cwsr_size) {
+			pr_warn_ratelimited("kfd: item-1 cwsr size mismatch (asked 0x%llx need 0x%zx)\n",
+				(u64)q_properties.ctx_save_restore_area_size,
+				total_cwsr_size);
+			err = -EINVAL;
+			goto err_bind_process;
+		}
+
+		err = kfd_alloc_cwsr_vram(pdd,
+					  q_properties.ctx_save_restore_area_address,
+					  total_cwsr_size, &q_properties);
+		if (err) {
+			pr_debug("driver cwsr alloc failed: %d\n", err);
+			/*
+			 * No silent fallback: userspace explicitly opted in.
+			 * Fail the ioctl so the thunk can decide what to do
+			 * (retry without the flag, fail the queue, etc.).
+			 */
+			goto err_bind_process;
+		}
+		args->queue_create_flags |=
+			KFD_IOC_QUEUE_FLAGS_DRIVER_CWSR_GRANTED;
+	} else {
+		/*
+		 * Clear the GRANTED bit on every legacy / non-granted path
+		 * so old userspace that happens to set it (it shouldn't)
+		 * never sees a phantom grant.
+		 */
+		args->queue_create_flags &=
+			~KFD_IOC_QUEUE_FLAGS_DRIVER_CWSR_GRANTED;
+	}
+
 	err = kfd_queue_acquire_buffers(pdd, &q_properties);
 	if (err) {
 		pr_debug("failed to acquire user queue buffers\n");
@@ -443,6 +521,16 @@ err_create_queue:
 err_acquire_queue_buf:
 err_sdma_engine_id:
 err_bind_process:
+	/*
+	 * V17.5 Item 1 (cwsr-resilient): if we allocated driver CWSR
+	 * before acquire_buffers / pqm_create_queue ran, we must release
+	 * it here. kfd_free_cwsr_vram is a no-op when cwsr_drv_owned ==
+	 * false, so it's safe on every error path through this label.
+	 * Successful return transfers ownership of cwsr_drv_* to the
+	 * queue; pqm_destroy_queue eventually frees it via the existing
+	 * kfd_queue_release_buffers chain (extended in this commit).
+	 */
+	kfd_free_cwsr_vram(pdd, &q_properties);
 err_pdd:
 	mutex_unlock(&p->mutex);
 	return err;
