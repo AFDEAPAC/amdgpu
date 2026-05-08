@@ -2524,6 +2524,8 @@ svm_range_unmap_from_cpu(struct mm_struct *mm, struct svm_range *prange,
 	if (atomic_read(&prange->queue_refcount)) {
 		int r;
 		bool defer = false;
+		unsigned long va_start = prange->start << PAGE_SHIFT;
+		unsigned long va_end = (prange->last + 1) << PAGE_SHIFT;
 
 		/*
 		 * V17.5 Phase C2: if the user VMA covering this range is
@@ -2538,9 +2540,6 @@ svm_range_unmap_from_cpu(struct mm_struct *mm, struct svm_range *prange,
 		 * we know userspace is still keeping the mapping alive.
 		 */
 		if (kfd_defer_queue_eviction) {
-			unsigned long va_start = prange->start << PAGE_SHIFT;
-			unsigned long va_end =
-				(prange->last + 1) << PAGE_SHIFT;
 			struct vm_area_struct *vma;
 
 			mmap_assert_locked(mm);
@@ -2548,6 +2547,31 @@ svm_range_unmap_from_cpu(struct mm_struct *mm, struct svm_range *prange,
 			if (vma && vma->vm_start <= va_start &&
 			    vma->vm_end >= va_end)
 				defer = true;
+		}
+
+		/*
+		 * V17.5 Item 2 (cwsr-resilient): belt-and-suspenders for the
+		 * VMA-level CWSR lock. If we previously set VM_LOCKED on the
+		 * VMAs and the unmap notifier still fires (partial mremap,
+		 * THP collapse on older kernels, etc.) AND any VMA overlap
+		 * still exists in our range, prefer to defer rather than
+		 * destroying a queue the process explicitly told us was
+		 * vital. We log loudly because VM_LOCKED was supposed to
+		 * keep the reclaim path off this range — repeated hits here
+		 * indicate the kernel is using a notifier path we didn't
+		 * anticipate, and triage should follow.
+		 */
+		if (!defer && kfd_protect_cwsr_vma && prange->vma_locked) {
+			struct vm_area_struct *vma2;
+
+			mmap_assert_locked(mm);
+			vma2 = find_vma(mm, va_start);
+			if (vma2 && vma2->vm_start < va_end) {
+				pr_warn_ratelimited(
+					"kfd: item-2 deferring eviction (VM_LOCKED prange got unmap notifier) prange 0x%lx-0x%lx\n",
+					va_start, va_end);
+				defer = true;
+			}
 		}
 
 		if (defer) {
