@@ -24,9 +24,11 @@
 
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/mman.h>
 #include <linux/sched/mm.h>
 #include <linux/mmap_lock.h>
 #include <linux/dma-buf.h>
+#include <linux/err.h>
 #include <kcl/backport/kcl_mm_backport.h>
 #include "kfd_priv.h"
 #include "kfd_topology.h"
@@ -658,12 +660,58 @@ int kfd_alloc_cwsr_vram(struct kfd_process_device *pdd, uint64_t gpu_va,
 		goto err_free_handle;
 	}
 
+	/*
+	 * V17.5 Item 1 e/5: export a dma_buf and mmap it into the user mm
+	 * at the same VA we just mapped into GPUVM. Because thunk picks
+	 * the VA from the SVM aperture (where user-VA == GPU-VA), one
+	 * value of ctx_save_restore_address serves both:
+	 *   - HW save/restore (programmed via MQD; accesses via GPUVM)
+	 *   - thunk's fill_cwsr_header() (CPU writes via the BAR-backed
+	 *     user mapping)
+	 *
+	 * MAP_FIXED_NOREPLACE returns -EEXIST if the VA is busy — never
+	 * silently clobber an existing user mapping. Failure fails the
+	 * whole alloc; we tear down the GPUVM mapping and return error.
+	 *
+	 * No dma_buf_{begin,end}_cpu_access dance is needed because the
+	 * BO is allocated with KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC -> the
+	 * VRAM BAR aperture is directly CPU-accessible via uncached
+	 * memory mapping. Reads/writes are PCIe-coherent without an
+	 * explicit invalidate/flush step.
+	 */
+	{
+		struct dma_buf *dmabuf = NULL;
+		unsigned long user_va;
+		int dret;
+
+		dret = amdgpu_amdkfd_gpuvm_export_dmabuf(mem, &dmabuf);
+		if (dret || !dmabuf) {
+			pr_warn_ratelimited("kfd: item-1 dmabuf export failed ret=%d\n",
+					    dret);
+			ret = dret ? dret : -ENOMEM;
+			goto err_unmap;
+		}
+
+		user_va = vm_mmap(dmabuf->file, gpu_va, size,
+				  PROT_READ | PROT_WRITE,
+				  MAP_SHARED | MAP_FIXED_NOREPLACE, 0);
+
+		if (IS_ERR_VALUE(user_va) || user_va != gpu_va) {
+			pr_warn_ratelimited("kfd: item-1 vm_mmap@0x%llx size=0x%zx returned 0x%lx\n",
+					    gpu_va, size, user_va);
+			dma_buf_put(dmabuf);
+			ret = IS_ERR_VALUE(user_va) ? (int)user_va : -EBUSY;
+			goto err_unmap;
+		}
+
+		q_props->cwsr_drv_dmabuf = dmabuf;	/* refcount kept for lifetime */
+		q_props->cwsr_drv_user_va = user_va;
+	}
+
 	atomic64_add(PAGE_ALIGN(size), &pdd->vram_usage);
 
 	q_props->cwsr_drv_mem = mem;
 	q_props->cwsr_drv_idr_handle = idr_handle;
-	q_props->cwsr_drv_dmabuf = NULL;	/* exported in Item 1 e/5 */
-	q_props->cwsr_drv_user_va = 0;		/* mmap'd in Item 1 e/5 */
 	q_props->cwsr_drv_mmap_offset = mmap_offset;
 	q_props->cwsr_drv_owned = true;
 	q_props->ctx_save_restore_area_address = gpu_va;
@@ -673,6 +721,9 @@ int kfd_alloc_cwsr_vram(struct kfd_process_device *pdd, uint64_t gpu_va,
 		 gpu_va, size, mmap_offset);
 	return 0;
 
+err_unmap:
+	(void)amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(pdd->dev->adev, mem,
+							pdd->drm_priv);
 err_free_handle:
 	kfd_process_device_remove_obj_handle(pdd, idr_handle);
 err_free_mem:
@@ -699,6 +750,26 @@ void kfd_free_cwsr_vram(struct kfd_process_device *pdd,
 
 	if (!q_props || !q_props->cwsr_drv_owned)
 		return;
+
+	/*
+	 * V17.5 Item 1 e/5: tear down the user mmap first. We attempt
+	 * vm_munmap from the calling task's mm, which is correct on the
+	 * normal destroy_queue ioctl path (current is a thread in the
+	 * owning process). On the process-exit path (pqm_uninit ->
+	 * release_buffers), current->mm has already been replaced with
+	 * the dying process' final mm or with init_mm — vm_munmap on
+	 * init_mm is a no-op. Either way the dma_buf_put below releases
+	 * the file ref and the mmap is torn down by the kernel during
+	 * exit_mmap. So vm_munmap is best-effort.
+	 */
+	if (q_props->cwsr_drv_user_va && current && current->mm) {
+		uint64_t munmap_size =
+			PAGE_ALIGN(q_props->ctx_save_restore_area_size);
+
+		if (munmap_size)
+			(void)vm_munmap(q_props->cwsr_drv_user_va,
+					munmap_size);
+	}
 
 	mem = q_props->cwsr_drv_mem;
 	if (!mem || !pdd || !pdd->dev)
