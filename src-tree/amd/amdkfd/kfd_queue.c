@@ -77,6 +77,34 @@ module_param(kfd_protect_cwsr_vma, int, 0644);
 MODULE_PARM_DESC(kfd_protect_cwsr_vma,
 		 "Set VM_LOCKED on CWSR/queue-vital VMAs to prevent reclaim (default: 1)");
 
+/*
+ * V17.5 Item 1 (cwsr-resilient): driver-allocated VRAM CWSR.
+ *
+ * Master toggle for the root-cause fix of the "Freeing queue vital
+ * buffer 0x7f...." dmesg path. When 1, KFD honors the
+ * KFD_IOC_QUEUE_FLAGS_USE_DRIVER_CWSR input flag from CREATE_QUEUE
+ * by allocating the CWSR area from VRAM via amdgpu_amdkfd_alloc_gtt_mem
+ * + AMDGPU_GEM_DOMAIN_VRAM and exposing a CPU-readable user VA via
+ * dma_buf+vm_mmap. VRAM is not cgroup-accounted so kernel direct
+ * reclaim cannot evict the CWSR pages and queue eviction from cgroup
+ * pressure becomes structurally impossible.
+ *
+ * Default 0 (opt-in). Userspace also has to opt in via the ioctl
+ * flag — modparam alone is insufficient — so a fleet-wide flip of
+ * this value to 1 has no effect until libhsakmt also runs the new
+ * code path (HSA_CWSR_IN_VRAM=auto/1 + new thunk).
+ *
+ * Coexistence with Item 2 (kfd_protect_cwsr_vma): when Item 1 grants
+ * the request, kfd_queue_buffer_svm_get is bypassed for the CWSR
+ * range (Item 1 d/5), so Item 2's vma-lock branch is naturally a
+ * no-op for that range. Both can be enabled simultaneously for
+ * mixed workloads.
+ */
+int kfd_cwsr_in_vram;	/* default 0 (off); module_param below */
+module_param(kfd_cwsr_in_vram, int, 0644);
+MODULE_PARM_DESC(kfd_cwsr_in_vram,
+		 "Allocate CWSR buffer from VRAM (driver-managed) when userspace requests it (default: 0)");
+
 void print_queue_properties(struct queue_properties *q)
 {
 	if (!q)

@@ -247,6 +247,14 @@ extern int kfd_defer_queue_eviction;
  */
 extern int kfd_protect_cwsr_vma;
 
+/*
+ * V17.5 Item 1 (cwsr-resilient): driver-allocated VRAM CWSR.
+ * Master toggle for the root-cause fix; default 0 (opt-in). Honored
+ * only when userspace also sets KFD_IOC_QUEUE_FLAGS_USE_DRIVER_CWSR
+ * in kfd_ioctl_create_queue_args.queue_create_flags.
+ */
+extern int kfd_cwsr_in_vram;
+
 extern struct mutex kfd_processes_mutex;
 
 enum cache_policy {

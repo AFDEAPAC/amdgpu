@@ -46,9 +46,14 @@
  * - 1.18 - Rename pad in set_memory_policy_args to misc_process_flag
  * - 1.19 - Add process wait status counters for ROCr survival polling
  * - 1.20 - Add unmap wait status and queue survival status query
+ * - 1.21 - V17.5 Item 1 (cwsr-resilient): repurpose
+ *          kfd_ioctl_create_queue_args.pad as queue_create_flags;
+ *          define KFD_IOC_QUEUE_FLAGS_USE_DRIVER_CWSR (in) and
+ *          KFD_IOC_QUEUE_FLAGS_DRIVER_CWSR_GRANTED (out) so userspace
+ *          can opt into driver-allocated VRAM CWSR.
  */
 #define KFD_IOCTL_MAJOR_VERSION 1
-#define KFD_IOCTL_MINOR_VERSION 20
+#define KFD_IOCTL_MINOR_VERSION 21
 
 struct kfd_ioctl_get_version_args {
 	__u32 major_version;	/* from KFD */
@@ -67,6 +72,30 @@ struct kfd_ioctl_get_version_args {
 
 #define KFD_MIN_QUEUE_RING_SIZE		1024
 
+/*
+ * For kfd_ioctl_create_queue_args.queue_create_flags.
+ *
+ * V17.5 Item 1 (cwsr-resilient): KFD_IOC_QUEUE_FLAGS_USE_DRIVER_CWSR
+ * (input) requests that the driver allocate the CWSR (context save/
+ * restore) buffer from VRAM and map it into the process's address space
+ * itself, instead of having userspace mmap host pages and pass the user
+ * VA in ctx_save_restore_address. Pairs with the modparam
+ * /sys/module/amdgpu/parameters/kfd_cwsr_in_vram (default 0). The
+ * driver may decline the request — for example, when the modparam is 0
+ * or VRAM allocation fails — in which case the legacy host-CWSR path
+ * is used and KFD_IOC_QUEUE_FLAGS_DRIVER_CWSR_GRANTED is NOT set on
+ * return. When the request is granted, the driver writes the user VA
+ * back into ctx_save_restore_address before returning.
+ *
+ * Layout: bit 31 (input request), bit 30 (output grant ack). All other
+ * bits are reserved and MUST be written 0 by userspace.
+ */
+#define KFD_IOC_QUEUE_FLAGS_USE_DRIVER_CWSR	(1u << 31)
+#define KFD_IOC_QUEUE_FLAGS_DRIVER_CWSR_GRANTED	(1u << 30)
+#define KFD_IOC_QUEUE_FLAGS_VALID_MASK					\
+	(KFD_IOC_QUEUE_FLAGS_USE_DRIVER_CWSR |				\
+	 KFD_IOC_QUEUE_FLAGS_DRIVER_CWSR_GRANTED)
+
 struct kfd_ioctl_create_queue_args {
 	__u64 ring_base_address;	/* to KFD */
 	__u64 write_pointer_address;	/* from KFD */
@@ -82,11 +111,17 @@ struct kfd_ioctl_create_queue_args {
 
 	__u64 eop_buffer_address;	/* to KFD */
 	__u64 eop_buffer_size;	/* to KFD */
-	__u64 ctx_save_restore_address; /* to KFD */
-	__u32 ctx_save_restore_size;	/* to KFD */
+	__u64 ctx_save_restore_address; /* to KFD; from KFD on grant */
+	__u32 ctx_save_restore_size;	/* to KFD; from KFD on grant */
 	__u32 ctl_stack_size;		/* to KFD */
 	__u32 sdma_engine_id;		/* to KFD */
-	__u32 pad;
+	/*
+	 * V17.5 Item 1: was 'pad' (unused). Layout-compatible: same offset,
+	 * same width. Old userspace zero-init the struct so reads as 0 ->
+	 * legacy path. New userspace sets KFD_IOC_QUEUE_FLAGS_USE_DRIVER_CWSR
+	 * to opt into VRAM CWSR.
+	 */
+	__u32 queue_create_flags;	/* to KFD (input bits) + from KFD (output bits) */
 };
 
 struct kfd_ioctl_destroy_queue_args {
