@@ -1115,10 +1115,15 @@ svm_range_split_adjust(struct svm_range *new, struct svm_range *old,
 	 * pinned_pages/gup_pinned — it would otherwise double-unpin on put.
 	 * The original prange retains the pin and will release it normally
 	 * via kfd_queue_buffer_svm_put() when its queue_refcount hits zero.
+	 *
+	 * V17.5 Item 2 (cwsr-resilient): vma_locked is owned by the original
+	 * prange that set VM_LOCKED on the underlying VMAs; split siblings
+	 * must NOT inherit it for the same reason (double-clear races).
 	 */
 	new->pinned_pages = NULL;
 	new->pinned_npages = 0;
 	new->gup_pinned = false;
+	new->vma_locked = false;
 
 	return 0;
 }
@@ -2064,10 +2069,11 @@ static struct svm_range *svm_range_clone(struct svm_range *old)
 	bitmap_copy(new->bitmap_aip, old->bitmap_aip, MAX_GPU_INSTANCE);
 	atomic_set(&new->queue_refcount, atomic_read(&old->queue_refcount));
 
-	/* V17.5 Phase C: see comment in svm_range_split_adjust(). */
+	/* V17.5 Phase C / Item 2: see comment in svm_range_split_adjust(). */
 	new->pinned_pages = NULL;
 	new->pinned_npages = 0;
 	new->gup_pinned = false;
+	new->vma_locked = false;
 
 	return new;
 }

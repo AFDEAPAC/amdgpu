@@ -149,6 +149,22 @@ struct svm_range {
 	struct page			**pinned_pages;
 	unsigned long			pinned_npages;
 	bool				gup_pinned;
+
+	/*
+	 * V17.5 Item 2 (cwsr-resilient): VMA-level CWSR protection.
+	 * True when this prange has applied VM_LOCKED|VM_DONTCOPY to the
+	 * user VMAs intersecting [prange->start..prange->last]. Owned
+	 * exclusively by the prange that took the lock; split siblings
+	 * MUST NOT inherit it (handled in svm_range_split_adjust /
+	 * svm_range_split_pages — they zero this field on the new prange).
+	 *
+	 * Cleared in two places:
+	 *   1. kfd_queue_unlock_vma_for_prange() when queue_refcount drops
+	 *      to zero (normal lifecycle).
+	 *   2. svm_range_free() bottom guard, mirroring gup_pinned, in
+	 *      case the process exited with refcount stuck.
+	 */
+	bool				vma_locked;
 };
 
 static inline void svm_range_lock(struct svm_range *prange)

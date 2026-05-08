@@ -247,6 +247,138 @@ void kfd_queue_unpin_svm_prange(struct kfd_process *p,
 	prange->gup_pinned = false;
 }
 
+/*
+ * V17.5 Item 2 (cwsr-resilient): VMA-level CWSR protection.
+ *
+ * Walks every VMA in [uaddr, uaddr+size) and sets VM_LOCKED|VM_DONTCOPY
+ * on it. Pages backed by VM_LOCKED VMAs are skipped by the kernel page
+ * reclaim path (try_to_unmap / shrink_*_list), so MMU_NOTIFY_UNMAP from
+ * direct reclaim can no longer fire for these ranges. VM_DONTCOPY also
+ * keeps fork() COW-induced notifier callbacks from racing the parent.
+ *
+ * Unlike the disabled Phase C path (pin_user_pages_remote(FOLL_LONGTERM)),
+ * VM_LOCKED never triggers svm_migrate_to_ram on GPU_ALWAYS_MAPPED ranges
+ * — it is the same primitive userspace mlock(2) uses, so the kernel mm
+ * core handles it without any AMD-specific migration logic.
+ *
+ * We deliberately do NOT update mm->locked_vm: the /proc/<pid>/smaps
+ * VmLck field is derived from VMA flags, so it stays accurate, but we
+ * avoid the RLIMIT_MEMLOCK accounting that would otherwise fail when a
+ * container's RLIMIT_MEMLOCK is small.
+ *
+ * Caller must hold p->svms.lock and have prange->queue_refcount > 0.
+ * Failure is non-fatal: queue creation must NEVER be blocked by this
+ * optimization.
+ */
+static int kfd_queue_lock_vma_for_prange(struct kfd_process *p,
+					 struct svm_range *prange)
+{
+	unsigned long uaddr = prange->start << PAGE_SHIFT;
+	unsigned long size = (prange->last - prange->start + 1) << PAGE_SHIFT;
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	unsigned long cur = uaddr, end = uaddr + size;
+	bool any_locked = false;
+	int ret = 0;
+
+	if (!size)
+		return -EINVAL;
+
+	mm = get_task_mm(p->lead_thread);
+	if (!mm)
+		return -ESRCH;
+
+	mmap_write_lock(mm);
+	vma = find_vma(mm, cur);
+	while (vma && vma->vm_start < end) {
+		/*
+		 * Skip already-locked VMAs (e.g. user explicitly mlock()ed,
+		 * or a sibling prange of the same allocation locked it
+		 * earlier in this loop).
+		 */
+		if (!(vma->vm_flags & VM_LOCKED)) {
+			vm_flags_set(vma, VM_LOCKED | VM_DONTCOPY);
+			any_locked = true;
+		}
+		if (vma->vm_end >= end)
+			break;
+		cur = vma->vm_end;
+		vma = find_vma(mm, cur);
+	}
+	mmap_write_unlock(mm);
+
+	/*
+	 * Materialize the lock. mm_populate faults pages in and pins them
+	 * onto the unevictable LRU. Done outside mmap_write_lock because
+	 * mm_populate takes mmap_read_lock internally.
+	 *
+	 * Errors are advisory only — VM_LOCKED is set, so reclaim still
+	 * skips these pages on demand even if they're not all populated.
+	 */
+	if (any_locked)
+		mm_populate(uaddr, size);
+	else
+		ret = -ENOENT;
+
+	mmput(mm);
+
+	if (any_locked) {
+		prange->vma_locked = true;
+		atomic_long_add(size, &p->pinned_svm_bytes);
+		atomic_inc(&p->pinned_svm_ranges);
+	}
+	return ret;
+}
+
+/*
+ * Mirror of kfd_queue_lock_vma_for_prange: clear VM_LOCKED|VM_DONTCOPY on
+ * every VMA we touched. Idempotent: safe to call from the bottom guard
+ * even when the user VMA has already been munmapped (find_vma simply
+ * returns NULL for that range and we no-op).
+ */
+void kfd_queue_unlock_vma_for_prange(struct kfd_process *p,
+				     struct svm_range *prange)
+{
+	unsigned long uaddr, size, cur, end;
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+
+	if (!prange->vma_locked)
+		return;
+
+	uaddr = prange->start << PAGE_SHIFT;
+	size = (prange->last - prange->start + 1) << PAGE_SHIFT;
+	cur = uaddr;
+	end = uaddr + size;
+
+	mm = get_task_mm(p->lead_thread);
+	if (!mm) {
+		/*
+		 * Process is exiting; the mm has already been torn down
+		 * along with all its VMAs. Just clear our bookkeeping.
+		 */
+		goto clear_state;
+	}
+
+	mmap_write_lock(mm);
+	vma = find_vma(mm, cur);
+	while (vma && vma->vm_start < end) {
+		if (vma->vm_flags & VM_LOCKED)
+			vm_flags_clear(vma, VM_LOCKED | VM_DONTCOPY);
+		if (vma->vm_end >= end)
+			break;
+		cur = vma->vm_end;
+		vma = find_vma(mm, cur);
+	}
+	mmap_write_unlock(mm);
+	mmput(mm);
+
+clear_state:
+	atomic_long_sub(size, &p->pinned_svm_bytes);
+	atomic_dec(&p->pinned_svm_ranges);
+	prange->vma_locked = false;
+}
+
 static int kfd_queue_buffer_svm_get(struct kfd_process_device *pdd, u64 addr, u64 size)
 {
 	struct kfd_process *p = pdd->process;

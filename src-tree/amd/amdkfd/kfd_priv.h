@@ -1206,6 +1206,15 @@ struct svm_range;
 void kfd_queue_unpin_svm_prange(struct kfd_process *p,
 				struct svm_range *prange);
 
+/*
+ * V17.5 Item 2 (cwsr-resilient): bottom-guard helper used by
+ * svm_range_free() to release any leftover VMA-level CWSR lock
+ * (VM_LOCKED|VM_DONTCOPY) the prange may still own. Defined in
+ * kfd_queue.c.
+ */
+void kfd_queue_unlock_vma_for_prange(struct kfd_process *p,
+				     struct svm_range *prange);
+
 #define KFD_PROCESS_TABLE_SIZE 5 /* bits: 32 entries */
 extern DECLARE_HASHTABLE(kfd_processes_table, KFD_PROCESS_TABLE_SIZE);
 extern struct srcu_struct kfd_processes_srcu;
