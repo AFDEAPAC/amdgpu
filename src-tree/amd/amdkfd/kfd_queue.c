@@ -850,6 +850,23 @@ int kfd_queue_acquire_buffers(struct kfd_process_device *pdd, struct queue_prope
 			  * NUM_XCC(pdd->dev->xcc_mask);
 	total_cwsr_size = ALIGN(total_cwsr_size, PAGE_SIZE);
 
+	/*
+	 * V17.5 Item 1 (cwsr-resilient): if the driver allocated the CWSR
+	 * BO from VRAM (Item 1 c/5 path), the kgd_mem is already registered
+	 * with the process VM and refcount-tracked via the per-process IDR
+	 * table — no kfd_queue_buffer_get / svm_get is needed (and would
+	 * fail anyway because there is no SVM range for this VA).
+	 *
+	 * Skip both steps and return success directly. cwsr_bo stays NULL
+	 * (the buffer-put path checks before deref) and queue_refcount on
+	 * any prange is left untouched (none was incremented for this VA).
+	 */
+	if (properties->cwsr_drv_owned) {
+		pr_debug("kfd: item-1 skipping cwsr buffer_get / svm_get (driver owns 0x%llx)\n",
+			 properties->ctx_save_restore_area_address);
+		goto out_unreserve;
+	}
+
 	err = kfd_queue_buffer_get(vm, (void *)properties->ctx_save_restore_area_address,
 				   &properties->cwsr_bo, total_cwsr_size);
 	if (!err)
@@ -899,13 +916,17 @@ int kfd_queue_release_buffers(struct kfd_process_device *pdd, struct queue_prope
 
 	/*
 	 * V17.5 Item 1 (cwsr-resilient): if this queue's CWSR is owned
-	 * by the driver (Item 1 path), free the VRAM BO + GPUVM mapping
-	 * here, mirroring kfd_alloc_cwsr_vram. The legacy SVM-put path
-	 * below is a no-op in that mode (Item 1 d/5 ensures the
-	 * acquire-side never registered an SVM range for this CWSR).
+	 * by the driver, free the VRAM BO + GPUVM mapping here. Skip the
+	 * legacy svm_put path in that mode — no SVM range was registered
+	 * for this VA (Item 1 d/5 in kfd_queue_acquire_buffers), so a
+	 * svm_put would just be a wasted lookup, and on multi-XCC systems
+	 * with overlapping address layouts could decrement an unrelated
+	 * range's queue_refcount.
 	 */
-	if (properties->cwsr_drv_owned)
+	if (properties->cwsr_drv_owned) {
 		kfd_free_cwsr_vram(pdd, properties);
+		return 0;
+	}
 
 	kfd_queue_buffer_svm_put(pdd, properties->ctx_save_restore_area_address, total_cwsr_size);
 	return 0;
