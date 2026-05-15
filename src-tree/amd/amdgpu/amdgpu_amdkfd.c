@@ -173,6 +173,18 @@ void amdgpu_amdkfd_device_init(struct amdgpu_device *adev)
 
 	amdgpu_amdkfd_gpuvm_init_mem_limits();
 
+	/*
+	 * V17.5 Phase D1: per-cgroup pin accounting table. Allocate before
+	 * kgd2kfd_device_init so all KFD pin paths see a valid table from
+	 * t=0. On allocation failure we log and continue: charge/drop
+	 * helpers tolerate a NULL table by no-op'ing, which preserves the
+	 * pre-Phase-D behaviour (global counter only).
+	 */
+	if (amdgpu_kfd_cgroup_pin_table_init(adev))
+		dev_warn(adev->dev,
+			"Phase D1: cgroup_pin_table init failed, "
+			"falling back to global pin accounting\n");
+
 	if (adev->kfd.dev) {
 		struct kgd2kfd_shared_resources gpu_resources = {
 			.compute_vmid_bitmap =
@@ -248,6 +260,9 @@ void amdgpu_amdkfd_device_fini_sw(struct amdgpu_device *adev)
 		adev->kfd.dev = NULL;
 		amdgpu_amdkfd_total_mem_size -= adev->gmc.real_vram_size;
 	}
+
+	/* V17.5 Phase D1: drop cgroup pin table after KFD is gone */
+	amdgpu_kfd_cgroup_pin_table_fini(adev);
 }
 
 void amdgpu_amdkfd_interrupt(struct amdgpu_device *adev,

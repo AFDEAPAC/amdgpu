@@ -26,6 +26,8 @@
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/fdtable.h>
+#include <linux/memcontrol.h>
+#include <linux/cgroup.h>
 #include <drm/ttm/ttm_tt.h>
 
 #include <drm/drm_exec.h>
@@ -47,6 +49,238 @@
  */
 #define AMDGPU_USERPTR_RESTORE_DELAY_MS 1
 #define AMDGPU_RESERVE_MEM_LIMIT			(3UL << 29)
+
+/* -------------------------------------------------------------------------
+ * V17.5 Phase D1: per-cgroup pin accounting.
+ *
+ * Customer dmesg from 2026-04-29 showed
+ *   KFD RDMA pin rejected: pinned=17592186044412MB + new=2MB > max=4096MB
+ * which is an s64-as-u64 wrap of the global rdma_pinned_bytes counter when
+ * the legacy per-process accounting overshoots zero. The fix in
+ * amdgpu_kfd_rdma_accounting_read_clamped() prevents the wrap from
+ * propagating further, but it still allows a noisy neighbour pod to burn
+ * the entire global quota and lock the target pod out.
+ *
+ * Phase D1 adds a per-memcg bytes-pinned counter so that quota and victim
+ * selection can be made cgroup-local. This patch installs the table and
+ * the charge/drop helpers; Phase D4 wires the RDMA quota path to consult
+ * the per-cgroup limit; Phase D2/D3 use the table for victim selection.
+ * ------------------------------------------------------------------------- */
+
+#define KFD_CGROUP_PIN_BUCKETS_DEFAULT  64u
+
+struct kfd_cgroup_pin_entry {
+	u64                cgroup_id;       /* cgroup_id(memcg->css.cgroup); 0 = unused */
+	atomic64_t         bytes;           /* current bytes pinned in this cgroup */
+	atomic64_t         peak_bytes;      /* high-water mark */
+	atomic64_t         reject_count;    /* per-cgroup rejections (Phase D4) */
+	atomic64_t         evict_avoided;   /* Phase D2/D3 */
+	struct hlist_node  node;            /* unused while we use linear-probe */
+};
+
+static struct kfd_cgroup_pin_entry *
+amdgpu_kfd_cgroup_pin_table_alloc(unsigned int nr_buckets)
+{
+	struct kfd_cgroup_pin_entry *t;
+
+	if (!nr_buckets)
+		nr_buckets = KFD_CGROUP_PIN_BUCKETS_DEFAULT;
+
+	t = kcalloc(nr_buckets, sizeof(*t), GFP_KERNEL);
+	if (!t)
+		return NULL;
+	return t;
+}
+
+int amdgpu_kfd_cgroup_pin_table_init(struct amdgpu_device *adev)
+{
+	struct amdgpu_kfd_cgroup_pin_table *tab = &adev->kfd.cgroup_pin_table;
+
+	rwlock_init(&tab->lock);
+	atomic_set(&tab->live_entries, 0);
+	tab->nr_buckets = KFD_CGROUP_PIN_BUCKETS_DEFAULT;
+	tab->entries = amdgpu_kfd_cgroup_pin_table_alloc(tab->nr_buckets);
+	if (!tab->entries)
+		return -ENOMEM;
+	return 0;
+}
+
+void amdgpu_kfd_cgroup_pin_table_fini(struct amdgpu_device *adev)
+{
+	struct amdgpu_kfd_cgroup_pin_table *tab = &adev->kfd.cgroup_pin_table;
+
+	write_lock(&tab->lock);
+	kfree(tab->entries);
+	tab->entries = NULL;
+	tab->nr_buckets = 0;
+	atomic_set(&tab->live_entries, 0);
+	write_unlock(&tab->lock);
+}
+
+/*
+ * Linear-probe open hash. Concurrent readers OK under rwlock. Writers
+ * (alloc-on-miss) take write_lock. The table is small (64 buckets) and
+ * is sized to fit the number of distinct cgroups that own a GPU; even
+ * the heavy k8s pin storm in the customer trace only touched ~6 pods
+ * per node, so collisions are rare. If we overflow we return NULL and
+ * fall back to the global counter.
+ */
+static struct kfd_cgroup_pin_entry *
+kfd_cgroup_pin_lookup(struct amdgpu_kfd_cgroup_pin_table *tab, u64 cg_id)
+{
+	unsigned int i, start;
+
+	if (!tab->entries || !tab->nr_buckets || !cg_id)
+		return NULL;
+
+	start = (unsigned int)(cg_id % tab->nr_buckets);
+	for (i = 0; i < tab->nr_buckets; ++i) {
+		struct kfd_cgroup_pin_entry *e =
+			&tab->entries[(start + i) % tab->nr_buckets];
+		u64 id = READ_ONCE(e->cgroup_id);
+
+		if (id == cg_id)
+			return e;
+		if (!id)
+			return NULL;
+	}
+	return NULL;
+}
+
+static struct kfd_cgroup_pin_entry *
+kfd_cgroup_pin_get_or_alloc(struct amdgpu_kfd_cgroup_pin_table *tab, u64 cg_id)
+{
+	struct kfd_cgroup_pin_entry *e;
+	unsigned int i, start;
+
+	if (!cg_id)
+		return NULL;
+
+	read_lock(&tab->lock);
+	e = kfd_cgroup_pin_lookup(tab, cg_id);
+	read_unlock(&tab->lock);
+	if (e)
+		return e;
+
+	write_lock(&tab->lock);
+	e = kfd_cgroup_pin_lookup(tab, cg_id);
+	if (e)
+		goto unlock;
+
+	if (!tab->entries || !tab->nr_buckets)
+		goto unlock;
+
+	start = (unsigned int)(cg_id % tab->nr_buckets);
+	for (i = 0; i < tab->nr_buckets; ++i) {
+		struct kfd_cgroup_pin_entry *cand =
+			&tab->entries[(start + i) % tab->nr_buckets];
+		if (!cand->cgroup_id) {
+			atomic64_set(&cand->bytes, 0);
+			atomic64_set(&cand->peak_bytes, 0);
+			atomic64_set(&cand->reject_count, 0);
+			atomic64_set(&cand->evict_avoided, 0);
+			WRITE_ONCE(cand->cgroup_id, cg_id);
+			atomic_inc(&tab->live_entries);
+			e = cand;
+			break;
+		}
+	}
+unlock:
+	write_unlock(&tab->lock);
+	return e;
+}
+
+/*
+ * Charge `bytes` to the cgroup that owns `p`. Returns the entry on success
+ * (caller may inspect entry's atomic counters); NULL if the process has no
+ * memcg (root) or the table is full / disabled.
+ *
+ * Counters are clamped: bytes is interpreted unsigned, peak_bytes is
+ * updated only on increase, never on decrement. There is no negative
+ * value reachable from charge/drop, which is the structural fix for the
+ * "pinned=17592186044412MB" wrap observed in production rc4.
+ */
+struct kfd_cgroup_pin_entry *
+amdgpu_kfd_cgroup_pin_charge(struct amdgpu_device *adev,
+			     struct kfd_process *p, u64 bytes)
+{
+	struct kfd_cgroup_pin_entry *e;
+	u64 newv, peak;
+
+	if (!p || !bytes)
+		return NULL;
+	if (!p->kfd_memcg_id)
+		return NULL;
+
+	e = kfd_cgroup_pin_get_or_alloc(&adev->kfd.cgroup_pin_table,
+					p->kfd_memcg_id);
+	if (!e)
+		return NULL;
+
+	newv = (u64)atomic64_add_return((s64)bytes, &e->bytes);
+	atomic64_add((s64)bytes, &p->kfd_memcg_pinned_bytes);
+
+	/* lockless peak update */
+	for (;;) {
+		peak = (u64)atomic64_read(&e->peak_bytes);
+		if (newv <= peak)
+			break;
+		if (atomic64_cmpxchg(&e->peak_bytes, (s64)peak, (s64)newv) == (s64)peak)
+			break;
+	}
+	return e;
+}
+
+void amdgpu_kfd_cgroup_pin_drop(struct amdgpu_device *adev,
+				struct kfd_process *p, u64 bytes)
+{
+	struct kfd_cgroup_pin_entry *e;
+	s64 cur, want;
+
+	if (!p || !bytes)
+		return;
+	if (!p->kfd_memcg_id)
+		return;
+
+	e = kfd_cgroup_pin_get_or_alloc(&adev->kfd.cgroup_pin_table,
+					p->kfd_memcg_id);
+	if (!e)
+		return;
+
+	for (;;) {
+		cur = atomic64_read(&e->bytes);
+		want = cur - (s64)bytes;
+		if (want < 0)
+			want = 0;  /* clamp underflow */
+		if (atomic64_cmpxchg(&e->bytes, cur, want) == cur)
+			break;
+	}
+
+	for (;;) {
+		cur = atomic64_read(&p->kfd_memcg_pinned_bytes);
+		want = cur - (s64)bytes;
+		if (want < 0)
+			want = 0;
+		if (atomic64_cmpxchg(&p->kfd_memcg_pinned_bytes, cur, want) == cur)
+			break;
+	}
+}
+
+u64 amdgpu_kfd_cgroup_pin_bytes(struct amdgpu_device *adev, u64 cg_id)
+{
+	struct kfd_cgroup_pin_entry *e;
+	u64 v = 0;
+
+	read_lock(&adev->kfd.cgroup_pin_table.lock);
+	e = kfd_cgroup_pin_lookup(&adev->kfd.cgroup_pin_table, cg_id);
+	if (e)
+		v = (u64)atomic64_read(&e->bytes);
+	read_unlock(&adev->kfd.cgroup_pin_table.lock);
+	return v;
+}
+EXPORT_SYMBOL_GPL(amdgpu_kfd_cgroup_pin_charge);
+EXPORT_SYMBOL_GPL(amdgpu_kfd_cgroup_pin_drop);
+EXPORT_SYMBOL_GPL(amdgpu_kfd_cgroup_pin_bytes);
 
 /*
  * Align VRAM availability to 2MB to avoid fragmentation caused by 4K allocations in the tail 2MB
@@ -1578,6 +1812,47 @@ static s64 amdgpu_kfd_rdma_accounting_read_clamped(struct amdgpu_device *adev,
 	return 0;
 }
 
+extern uint amdgpu_rdma_pin_max_per_cgroup_mb;  /* V17.5 Phase D4 */
+
+/*
+ * V17.5 Phase D4: per-cgroup RDMA pin quota check.
+ *
+ * Returns true if the requested bytes fit within the per-cgroup cap
+ * (or if the cap is 0, or if the calling process has no memcg). Does
+ * NOT mutate any counter -- the actual charge to the per-cgroup
+ * counter happens in amdgpu_kfd_cgroup_pin_charge() in the pin success
+ * path; this is a pre-check so we can reject early with -ENOSPC and
+ * keep the global counter clean.
+ */
+static bool amdgpu_kfd_rdma_quota_cgroup_ok(struct amdgpu_device *adev,
+					    struct kfd_process *p,
+					    u64 bo_size)
+{
+	u64 cap = (u64)amdgpu_rdma_pin_max_per_cgroup_mb << 20;
+	u64 cur;
+
+	if (!cap)
+		return true;            /* Phase D4 disabled */
+	if (!p || !p->kfd_memcg_id)
+		return true;            /* no cgroup -> fall back to global */
+
+	cur = amdgpu_kfd_cgroup_pin_bytes(adev, p->kfd_memcg_id);
+	if (cur > cap || bo_size > cap - cur) {
+		struct kfd_cgroup_pin_entry *e =
+			kfd_cgroup_pin_get_or_alloc(&adev->kfd.cgroup_pin_table,
+						    p->kfd_memcg_id);
+		if (e)
+			atomic64_inc(&e->reject_count);
+		dev_info_ratelimited(adev->dev,
+			"KFD RDMA pin rejected per-cgroup: cg=%llu pinned=%lluMB + new=%lluMB > cap=%uMB\n",
+			(unsigned long long)p->kfd_memcg_id,
+			cur >> 20, bo_size >> 20,
+			amdgpu_rdma_pin_max_per_cgroup_mb);
+		return false;
+	}
+	return true;
+}
+
 static bool amdgpu_kfd_rdma_quota_try_charge(struct amdgpu_device *adev,
 						    u64 bo_size, u64 *new_total)
 {
@@ -1689,10 +1964,33 @@ int amdgpu_amdkfd_gpuvm_pin_bo(struct amdgpu_bo *bo, u32 domain)
 	 * Charge only once per KFD BO. PeerDirect can issue many get_pages()
 	 * calls for small subranges of the same BO; those are extra pin refs,
 	 * not extra physical pinned VRAM.
+	 *
+	 * V17.5 Phase D4: also enforce the per-cgroup cap before the global
+	 * check, so a noisy pod cannot saturate the global quota at the
+	 * expense of the target pod.
 	 */
 	if (dmabuf_pin_max_mb && kgd_mem && (domain & AMDGPU_GEM_DOMAIN_VRAM) &&
 	    !kgd_mem->rdma_quota_charged) {
 		u64 new_total = 0;
+		struct kfd_process *owner = NULL;
+
+		/* Resolve the BO owner once for the cgroup pre-check. */
+		if (kgd_mem->process_info && kgd_mem->process_info->pid) {
+			struct task_struct *otask;
+			rcu_read_lock();
+			otask = pid_task(kgd_mem->process_info->pid, PIDTYPE_PID);
+			if (otask)
+				owner = kfd_lookup_process_by_mm(otask->mm);
+			rcu_read_unlock();
+		}
+		if (owner &&
+		    !amdgpu_kfd_rdma_quota_cgroup_ok(adev, owner, bo_size)) {
+			kfd_unref_process(owner);
+			ret = -ENOSPC;
+			goto out;
+		}
+		if (owner)
+			kfd_unref_process(owner);
 
 		if (!amdgpu_kfd_rdma_quota_try_charge(adev, bo_size, &new_total)) {
 			ret = -ENOSPC;
@@ -1744,6 +2042,31 @@ int amdgpu_amdkfd_gpuvm_pin_bo(struct amdgpu_bo *bo, u32 domain)
 
 	if (!ret && bo->tbo.resource->mem_type == TTM_PL_VRAM)
 		atomic64_add(amdgpu_bo_size(bo), &adev->kfd.vram_pinned);
+
+	/*
+	 * V17.5 Phase D1: charge per-cgroup counter on a successful pin.
+	 * We charge for every successful pin (VRAM or GTT) so the table
+	 * accurately reflects pinned host AND device bytes per cgroup.
+	 * kgd_mem may be NULL (kernel-side internal BOs) -- skip those,
+	 * the cgroup attribution is meaningless without a user owner.
+	 */
+	if (!ret && kgd_mem && kgd_mem->process_info) {
+		struct kfd_process *owner = NULL;
+		struct pid *opid = kgd_mem->process_info->pid;
+		struct task_struct *otask;
+
+		if (opid) {
+			rcu_read_lock();
+			otask = pid_task(opid, PIDTYPE_PID);
+			if (otask)
+				owner = kfd_lookup_process_by_mm(otask->mm);
+			rcu_read_unlock();
+		}
+		if (owner) {
+			amdgpu_kfd_cgroup_pin_charge(adev, owner, bo_size);
+			kfd_unref_process(owner);
+		}
+	}
 
 	if (!ret && kgd_mem && dmabuf_pin_max_mb &&
 	    (domain & AMDGPU_GEM_DOMAIN_VRAM) &&
@@ -1870,6 +2193,30 @@ void amdgpu_amdkfd_gpuvm_unpin_bo(struct amdgpu_bo *bo)
 		if (dmabuf_pin_max_mb)
 			amdgpu_kfd_pin_watermark_check(adev,
 				(u64)amdgpu_kfd_rdma_accounting_read_clamped(adev, "watermark_after_unpin"));
+	}
+
+	/*
+	 * V17.5 Phase D1: drop the per-cgroup counter. Mirrors the charge
+	 * site in amdgpu_amdkfd_gpuvm_pin_bo. We must drop bytes for ANY
+	 * memory type (VRAM or GTT) since pin charged for any pin.
+	 */
+	if (kgd_mem && kgd_mem->process_info) {
+		struct kfd_process *owner = NULL;
+		struct pid *opid = kgd_mem->process_info->pid;
+		struct task_struct *otask;
+
+		if (opid) {
+			rcu_read_lock();
+			otask = pid_task(opid, PIDTYPE_PID);
+			if (otask)
+				owner = kfd_lookup_process_by_mm(otask->mm);
+			rcu_read_unlock();
+		}
+		if (owner) {
+			amdgpu_kfd_cgroup_pin_drop(adev, owner,
+						   amdgpu_bo_size(bo));
+			kfd_unref_process(owner);
+		}
 	}
 
 	amdgpu_bo_unreserve(bo);

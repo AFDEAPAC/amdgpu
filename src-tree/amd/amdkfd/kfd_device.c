@@ -1216,6 +1216,7 @@ int kgd2kfd_resume_mm(struct mm_struct *mm)
  * @fence: eviction fence attached to KFD process BOs
  *
  */
+#include <linux/memcontrol.h>
 int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
 					       struct dma_fence *fence)
 {
@@ -1246,6 +1247,33 @@ int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
 		delay_jiffies -= active_time;
 	else
 		delay_jiffies = 0;
+
+	/*
+	 * V17.5 Phase D3: cross-cgroup queue eviction isolation.
+	 *
+	 * If the *cause* of this eviction (current task) is in a different
+	 * cgroup than the *target* process p, and the policy is ISOLATE, we
+	 * extend delay_jiffies so the noisy neighbour has a chance to free
+	 * its own VRAM first. This converts a "noisy A evicts target B"
+	 * incident into "noisy A evicts itself first; target B only gets
+	 * touched if there's still pressure after that". For ISOLATE the
+	 * stretch is PROCESS_ACTIVE_TIME_MS again (doubling the cooldown).
+	 */
+#ifdef CONFIG_MEMCG
+	{
+		struct mem_cgroup *cur_mc;
+		extern int amdgpu_evict_cross_cgroup_policy;
+
+		rcu_read_lock();
+		cur_mc = mem_cgroup_from_task(current);
+		if (p->kfd_memcg && cur_mc && cur_mc != p->kfd_memcg &&
+		    amdgpu_evict_cross_cgroup_policy == 0 /* ISOLATE */) {
+			delay_jiffies += msecs_to_jiffies(PROCESS_ACTIVE_TIME_MS);
+			atomic64_inc(&p->kfd_memcg_queue_evict_avoided);
+		}
+		rcu_read_unlock();
+	}
+#endif
 
 	/* During process initialization eviction_work.dwork is initialized
 	 * to kfd_evict_bo_worker

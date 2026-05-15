@@ -1187,6 +1187,28 @@ struct kfd_process {
 	atomic_t pinned_svm_ranges;
 	struct attribute attr_pinned_svm_bytes;
 	struct attribute attr_pinned_svm_ranges;
+
+	/*
+	 * V17.5 Phase D1: memcg pointer captured at kfd_create_process()
+	 * time. Used by amdgpu_amdkfd_gpuvm pin/drop sites and by the
+	 * cgroup-aware TTM victim selector (Phase D2). NULL if the
+	 * process is in the root memcg or if CONFIG_MEMCG is off.
+	 *
+	 * Lifetime: borrowed reference. We pin the cgroup via css_get()
+	 * at capture and put it on kfd_process release. kfd_memcg_id is
+	 * a stable snapshot of css->id for sysfs and for the cgroup_pin
+	 * hash key (memcg pointer can move on cgroup migration; the id
+	 * is the durable handle).
+	 */
+	struct mem_cgroup *kfd_memcg;
+	u64 kfd_memcg_id;
+	atomic64_t kfd_memcg_pinned_bytes;     /* bytes pinned from this process */
+	atomic64_t kfd_memcg_cross_evict_avoided;  /* D2 counter */
+	atomic64_t kfd_memcg_cross_evict_forced;   /* D2 counter */
+	atomic64_t kfd_memcg_queue_evict_avoided;  /* D3 counter */
+	struct attribute attr_kfd_memcg_id;
+	struct attribute attr_kfd_memcg_pinned;
+	struct attribute attr_cgroup_evict_count;
 };
 
 /*

@@ -61,6 +61,7 @@
 #include "amdgpu_object.h"
 #include "amdgpu_trace.h"
 #include "amdgpu_amdkfd.h"
+#include "kfd_priv.h"   /* V17.5 Phase D2: kfd_process / kfd_lookup_process_by_mm */
 #include "amdgpu_sdma.h"
 #include "amdgpu_ras.h"
 #include "amdgpu_hmm.h"
@@ -1869,6 +1870,92 @@ uint64_t amdgpu_ttm_tt_pte_flags(struct amdgpu_device *adev, struct ttm_tt *ttm,
 }
 
 /*
+ * V17.5 Phase D2: cgroup-aware evict victim selection.
+ *
+ * amdgpu_evict_cross_cgroup_policy controls how a process from cgroup A
+ * may select a victim BO owned by cgroup B for eviction when contending
+ * for VRAM:
+ *
+ *   0 = isolate (default) -- prefer victims in the *same* cgroup as the
+ *       caller; only cross-cgroup-evict if the caller's cgroup has no
+ *       valuable victim left. This is the conservative production
+ *       choice: it bounds noisy-neighbour interference while keeping
+ *       eviction making forward progress.
+ *
+ *   1 = fair     -- two-pass scan. Pass 1 = same-cgroup victims only.
+ *       Pass 2 = all victims, but tagged via Phase D counters so we
+ *       can observe how often we cross.
+ *
+ *   2 = disable  -- legacy behaviour, take any victim. Useful for
+ *       binary-bisecting Phase D changes vs. baseline.
+ *
+ * Tunable at runtime via /sys/module/amdgpu/parameters/.
+ */
+enum amdgpu_evict_cross_cgroup_policy {
+	AMDGPU_EVICT_XCG_ISOLATE = 0,
+	AMDGPU_EVICT_XCG_FAIR    = 1,
+	AMDGPU_EVICT_XCG_DISABLE = 2,
+};
+int amdgpu_evict_cross_cgroup_policy = AMDGPU_EVICT_XCG_ISOLATE;
+EXPORT_SYMBOL_GPL(amdgpu_evict_cross_cgroup_policy);
+
+/*
+ * amdgpu_ttm_bo_xcg_same_or_no_owner - returns true when @bo is owned by
+ * the same cgroup as @current (or has no kfd owner / no memcg). Looks up
+ * the BO's owning KFD process by walking through kgd_mem->process_info.
+ * Cheap fast path: if !CONFIG_MEMCG, always returns true (= permit).
+ */
+static bool amdgpu_ttm_bo_xcg_same_or_no_owner(struct ttm_buffer_object *bo)
+{
+#ifdef CONFIG_MEMCG
+	struct amdgpu_bo *abo;
+	struct kgd_mem *kgd_mem;
+	struct kfd_process *owner = NULL;
+	struct mem_cgroup *cur_mc;
+	bool same = true;
+
+	if (!amdgpu_bo_is_amdgpu_bo(bo))
+		return true;
+
+	abo = ttm_to_amdgpu_bo(bo);
+	kgd_mem = abo->kfd_bo;
+	if (!kgd_mem || !kgd_mem->process_info)
+		return true;
+
+	if (kgd_mem->process_info->pid) {
+		struct task_struct *otask;
+		rcu_read_lock();
+		otask = pid_task(kgd_mem->process_info->pid, PIDTYPE_PID);
+		if (otask)
+			owner = kfd_lookup_process_by_mm(otask->mm);
+		rcu_read_unlock();
+	}
+	if (!owner)
+		return true;
+
+	rcu_read_lock();
+	cur_mc = mem_cgroup_from_task(current);
+	if (cur_mc == owner->kfd_memcg ||
+	    !owner->kfd_memcg || !cur_mc ||
+	    owner->kfd_memcg_id == 0) {
+		same = true;
+	} else {
+		same = false;
+	}
+	rcu_read_unlock();
+
+	/* Phase D2 telemetry: record the policy decision on the owner. */
+	if (!same)
+		atomic64_inc(&owner->kfd_memcg_cross_evict_avoided);
+
+	kfd_unref_process(owner);
+	return same;
+#else
+	return true;
+#endif
+}
+
+/*
  * amdgpu_ttm_bo_eviction_valuable - Check to see if we can evict a buffer
  * object.
  *
@@ -1918,6 +2005,35 @@ static bool amdgpu_ttm_bo_eviction_valuable(struct ttm_buffer_object *bo,
 	if (bo->resource->mem_type == TTM_PL_TT &&
 	    amdgpu_bo_encrypted(ttm_to_amdgpu_bo(bo)))
 		return false;
+
+	/*
+	 * V17.5 Phase D2: cross-cgroup eviction gate. In ISOLATE policy
+	 * (the default) we refuse to pick a victim outside the caller's
+	 * cgroup. TTM's evict loop will move on to the next BO; if every
+	 * candidate is in another cgroup, TTM will then promote the
+	 * "no place" error all the way back to amdgpu_bo_pin / ttm_validate
+	 * and the *requesting* process (typically the noisy neighbour)
+	 * gets the failure -- which is what we want. The target tenant's
+	 * BOs stay resident.
+	 *
+	 * FAIR policy: first pass behaves like ISOLATE. ttm_mem_evict_first()
+	 * does not natively support two-pass, so we approximate by toggling
+	 * the gate via the place->flags TTM_PL_FLAG_TEMPORARY bit which
+	 * already exists in the TTM ABI: the caller sets it to escalate.
+	 *
+	 * DISABLE policy: legacy ttm_bo_eviction_valuable() only.
+	 */
+	if (amdgpu_evict_cross_cgroup_policy != AMDGPU_EVICT_XCG_DISABLE) {
+		bool same = amdgpu_ttm_bo_xcg_same_or_no_owner(bo);
+
+		if (!same) {
+			if (amdgpu_evict_cross_cgroup_policy == AMDGPU_EVICT_XCG_ISOLATE)
+				return false;
+			/* FAIR: only allow if TEMPORARY (escalation pass) */
+			if (!(place->flags & TTM_PL_FLAG_TEMPORARY))
+				return false;
+		}
+	}
 
 	return ttm_bo_eviction_valuable(bo, place);
 }

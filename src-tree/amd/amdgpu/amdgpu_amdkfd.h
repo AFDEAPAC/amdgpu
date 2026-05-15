@@ -156,7 +156,43 @@ struct amdgpu_kfd_dev {
 
 	/* Client for KFD BO GEM handle allocations */
 	struct drm_client_dev client;
+
+	/*
+	 * V17.5 Phase D1: per-memcg pin accounting.
+	 *
+	 * cgroup_pin_table[] is a small open-hash of struct kfd_cgroup_pin_entry
+	 * indexed by ino_t (mem_cgroup css inode number). Each entry tracks
+	 * the bytes that were pinned by processes inside that cgroup, plus
+	 * a per-cgroup peak and a per-cgroup reject counter. All counters
+	 * are clamped at zero on underflow (the customer-observed u64 wrap
+	 * pinned=17592186044412MB only happens if a counter is allowed to
+	 * underflow into the negative s64 range; this table charges and
+	 * drops via clamped helpers).
+	 *
+	 * Read lock: cgroup_pin_rwlock (rwspinlock). Write lock for table
+	 * mutation; charge/drop are atomic on the entry's atomic64_t fields
+	 * after entry lookup under read lock.
+	 */
+	struct amdgpu_kfd_cgroup_pin_table {
+		struct kfd_cgroup_pin_entry *entries;  /* nr_buckets */
+		unsigned int nr_buckets;
+		rwlock_t lock;
+		atomic_t live_entries;
+	} cgroup_pin_table;
 };
+
+/* V17.5 Phase D1: opaque to consumers. Definition in amdgpu_amdkfd_gpuvm.c. */
+struct kfd_cgroup_pin_entry;
+struct kfd_process;  /* forward decl so the prototypes below see file-scope type */
+
+int  amdgpu_kfd_cgroup_pin_table_init(struct amdgpu_device *adev);
+void amdgpu_kfd_cgroup_pin_table_fini(struct amdgpu_device *adev);
+struct kfd_cgroup_pin_entry *
+amdgpu_kfd_cgroup_pin_charge(struct amdgpu_device *adev,
+			     struct kfd_process *p, u64 bytes);
+void amdgpu_kfd_cgroup_pin_drop(struct amdgpu_device *adev,
+				struct kfd_process *p, u64 bytes);
+u64  amdgpu_kfd_cgroup_pin_bytes(struct amdgpu_device *adev, u64 cg_id);
 
 /*
  * V15.5: a BO whose owning process dropped the mem without hipFree completing

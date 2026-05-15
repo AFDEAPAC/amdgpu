@@ -33,6 +33,8 @@
 #include <linux/mman.h>
 #include <linux/file.h>
 #include <linux/pm_runtime.h>
+#include <linux/memcontrol.h>
+#include <linux/cgroup.h>
 #include "amdgpu_amdkfd.h"
 #include "amdgpu.h"
 #include "amdgpu_reset.h"
@@ -344,6 +346,26 @@ static ssize_t kfd_procfs_show(struct kobject *kobj, struct attribute *attr,
 						     attr_pinned_svm_ranges);
 		return snprintf(buffer, PAGE_SIZE, "%d\n",
 				atomic_read(&p->pinned_svm_ranges));
+	} else if (strcmp(attr->name, "cgroup_id") == 0) {
+		struct kfd_process *p = container_of(attr, struct kfd_process,
+						     attr_kfd_memcg_id);
+		return snprintf(buffer, PAGE_SIZE, "%llu\n",
+				(unsigned long long)p->kfd_memcg_id);
+	} else if (strcmp(attr->name, "cgroup_pinned_bytes") == 0) {
+		struct kfd_process *p = container_of(attr, struct kfd_process,
+						     attr_kfd_memcg_pinned);
+		return snprintf(buffer, PAGE_SIZE, "%lld\n",
+				(long long)atomic64_read(&p->kfd_memcg_pinned_bytes));
+	} else if (strcmp(attr->name, "cgroup_evict_count") == 0) {
+		struct kfd_process *p = container_of(attr, struct kfd_process,
+						     attr_cgroup_evict_count);
+		return snprintf(buffer, PAGE_SIZE,
+				"cross_evict_avoided=%lld\n"
+				"cross_evict_forced=%lld\n"
+				"queue_evict_avoided=%lld\n",
+				(long long)atomic64_read(&p->kfd_memcg_cross_evict_avoided),
+				(long long)atomic64_read(&p->kfd_memcg_cross_evict_forced),
+				(long long)atomic64_read(&p->kfd_memcg_queue_evict_avoided));
 	} else if (strncmp(attr->name, "vram_", 5) == 0) {
 		struct kfd_process_device *pdd = container_of(attr, struct kfd_process_device,
 							      attr_vram);
@@ -897,6 +919,17 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
 				      &process->attr_pinned_svm_ranges,
 				      "pinned_svm_ranges");
 
+		/* V17.5 Phase D1/D3 visibility */
+		kfd_sysfs_create_file(process->kobj,
+				      &process->attr_kfd_memcg_id,
+				      "cgroup_id");
+		kfd_sysfs_create_file(process->kobj,
+				      &process->attr_kfd_memcg_pinned,
+				      "cgroup_pinned_bytes");
+		kfd_sysfs_create_file(process->kobj,
+				      &process->attr_cgroup_evict_count,
+				      "cgroup_evict_count");
+
 		process->kobj_queues = kobject_create_and_add("queues",
 							process->kobj);
 		if (!process->kobj_queues)
@@ -1128,6 +1161,10 @@ static void kfd_process_remove_sysfs(struct kfd_process *p)
 	/* V17.5 Phase C visibility */
 	sysfs_remove_file(p->kobj, &p->attr_pinned_svm_bytes);
 	sysfs_remove_file(p->kobj, &p->attr_pinned_svm_ranges);
+	/* V17.5 Phase D1/D3 visibility */
+	sysfs_remove_file(p->kobj, &p->attr_kfd_memcg_id);
+	sysfs_remove_file(p->kobj, &p->attr_kfd_memcg_pinned);
+	sysfs_remove_file(p->kobj, &p->attr_cgroup_evict_count);
 	kobject_del(p->kobj_queues);
 	kobject_put(p->kobj_queues);
 	p->kobj_queues = NULL;
@@ -1215,6 +1252,20 @@ static void kfd_process_wq_release(struct work_struct *work)
 	kfd_event_free_process(p);
 
 	mutex_destroy(&p->mutex);
+
+	/*
+	 * V17.5 Phase D1: drop the borrowed memcg css reference we took in
+	 * create_process(). Safe to do without a per-process mutex because
+	 * by the time we reach _wq_release(), p->ref == 0 and no other
+	 * path can observe p->kfd_memcg anymore (sysfs files were torn
+	 * down by kfd_process_remove_sysfs above).
+	 */
+#ifdef CONFIG_MEMCG
+	if (p->kfd_memcg) {
+		css_put(&p->kfd_memcg->css);
+		p->kfd_memcg = NULL;
+	}
+#endif
 
 	put_task_struct(p->lead_thread);
 
@@ -1595,6 +1646,59 @@ static struct kfd_process *create_process(const struct task_struct *thread)
 	process->lead_thread = thread->group_leader;
 	process->n_pdds = 0;
 	process->queues_paused = false;
+
+	/*
+	 * V17.5 Phase D1: capture the memcg this process belongs to so the
+	 * Phase D2 (TTM victim selection) and Phase D3 (KFD queue evict)
+	 * paths can compare cgroups without re-walking task->cgroups every
+	 * time. We hold a borrowed reference via css_get(); released in
+	 * kfd_process_destroy_kfd_thread (see kfd_process_release path).
+	 *
+	 * Falls back to NULL kfd_memcg / id=0 if:
+	 *   - CONFIG_MEMCG is off,
+	 *   - the process is in the root memcg,
+	 *   - mem_cgroup_from_task() returns NULL (kernel-thread context).
+	 * NULL memcg means "no isolation" -- charge/drop paths skip
+	 * per-cgroup accounting and fall back to the global counter.
+	 */
+#ifdef CONFIG_MEMCG
+	{
+		struct mem_cgroup *mc;
+		u64 cgid = 0;
+
+		rcu_read_lock();
+		mc = mem_cgroup_from_task(process->lead_thread);
+		/*
+		 * mem_cgroup_is_root() / root_mem_cgroup are not exported
+		 * for module use on this kernel (5.10.x). Instead we filter
+		 * "root memcg" by its well-known cgroup id == 1: the v1/v2
+		 * root cgroup always carries id 1, every other cgroup gets
+		 * id >= 2 at create time. This is a stable, ABI-safe filter.
+		 */
+		if (mc) {
+			cgid = cgroup_id(mc->css.cgroup);
+			if (cgid > 1 && css_tryget(&mc->css)) {
+				process->kfd_memcg = mc;
+				process->kfd_memcg_id = cgid;
+			} else {
+				process->kfd_memcg = NULL;
+				process->kfd_memcg_id = 0;
+			}
+		} else {
+			process->kfd_memcg = NULL;
+			process->kfd_memcg_id = 0;
+		}
+		rcu_read_unlock();
+	}
+#else
+	process->kfd_memcg = NULL;
+	process->kfd_memcg_id = 0;
+#endif
+	atomic64_set(&process->kfd_memcg_pinned_bytes, 0);
+	atomic64_set(&process->kfd_memcg_cross_evict_avoided, 0);
+	atomic64_set(&process->kfd_memcg_cross_evict_forced, 0);
+	atomic64_set(&process->kfd_memcg_queue_evict_avoided, 0);
+
 	INIT_DELAYED_WORK(&process->eviction_work, evict_process_worker);
 	INIT_DELAYED_WORK(&process->restore_work, restore_process_worker);
 	process->last_restore_timestamp = get_jiffies_64();

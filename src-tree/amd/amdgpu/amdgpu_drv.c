@@ -1033,6 +1033,43 @@ MODULE_PARM_DESC(gtt_cgroup_reserve_mb,
 	"Reserve N MB of cgroup memcg budget when populating GTT (0=disabled, default 0)");
 
 /**
+ * DOC: evict_cross_cgroup_policy (int) [V17.5 Phase D2]
+ * Controls TTM evict victim selection across cgroups:
+ *   0 = isolate (default) -- never pick a victim from a different
+ *       cgroup than the requester. Bounds noisy-neighbour interference
+ *       to within a single cgroup.
+ *   1 = fair    -- allow cross-cgroup victims only on the escalation
+ *       pass (TTM_PL_FLAG_TEMPORARY set by caller).
+ *   2 = disable -- legacy behaviour (any victim is fair game).
+ *
+ * Telemetry: per-process counters reachable via
+ *   /sys/class/kfd/kfd/proc/<pid>/cgroup_evict_count
+ * track how often cross-cgroup victim selection was avoided.
+ */
+extern int amdgpu_evict_cross_cgroup_policy;
+module_param_named(evict_cross_cgroup_policy,
+		   amdgpu_evict_cross_cgroup_policy, int, 0644);
+MODULE_PARM_DESC(evict_cross_cgroup_policy,
+	"TTM evict victim cgroup policy: 0=isolate(default) 1=fair 2=disable");
+
+/**
+ * DOC: rdma_pin_max_per_cgroup_mb (uint) [V17.5 Phase D4]
+ * Per-cgroup KFD RDMA pin quota cap. When non-zero, a process from
+ * cgroup A is rejected with -ENOSPC if its cgroup is already pinning
+ * more than this many MB total across all KFD GPUs on this node. This
+ * is *in addition to* the legacy global dmabuf_pin_max_mb quota: a
+ * pin succeeds only when BOTH limits are within budget.
+ *
+ * Default 0 = disabled (fall back to legacy global accounting).
+ * Recommended deployment: 16384 (16 GB) per pod-class cgroup.
+ */
+uint amdgpu_rdma_pin_max_per_cgroup_mb;
+module_param_named(rdma_pin_max_per_cgroup_mb,
+		   amdgpu_rdma_pin_max_per_cgroup_mb, uint, 0644);
+MODULE_PARM_DESC(rdma_pin_max_per_cgroup_mb,
+	"Per-cgroup RDMA pin cap in MB (0=disabled, default 0)");
+
+/**
  * DOC: send_sigterm (int)
  * Send sigterm to HSA process on unhandled exceptions. Default is not to send sigterm
  * but just print errors on dmesg. Setting 1 enables sending sigterm.
