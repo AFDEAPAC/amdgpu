@@ -34,6 +34,9 @@
 #include "kfd_migrate.h"
 #include "kfd_smi_events.h"
 
+/* V17.5 Phase E3 — cap svm_migrate_to_ram mutex waits. Declared in amdgpu_drv.c */
+extern int amdgpu_kfd_migrate_deadline_ms;
+
 #ifdef dev_fmt
 #undef dev_fmt
 #endif
@@ -944,6 +947,51 @@ svm_migrate_to_vram(struct svm_range *prange, uint32_t best_loc,
 
 }
 
+/*
+ * V17.5 Phase E3 — bound mutex acquisition with a deadline so the CPU
+ * page fault handler in svm_migrate_to_ram() cannot hold mm->mmap_write_lock
+ * (taken upstream via __gup_longterm_locked for FOLL_LONGTERM pins) for
+ * longer than amdgpu_kfd_migrate_deadline_ms. Returns true on lock
+ * acquired, false on timeout.
+ *
+ * deadline_ms <= 0 means infinite wait (legacy behaviour for debug).
+ */
+static bool kfd_e3_mutex_lock_deadline(struct mutex *m, const char *name,
+				       unsigned long addr)
+{
+	int deadline_ms = READ_ONCE(amdgpu_kfd_migrate_deadline_ms);
+	unsigned long deadline;
+
+	if (deadline_ms <= 0) {
+		mutex_lock(m);
+		return true;
+	}
+	if (deadline_ms < 100)
+		deadline_ms = 100;
+	if (deadline_ms > 60000)
+		deadline_ms = 60000;
+
+	if (mutex_trylock(m))
+		return true;
+
+	deadline = jiffies + msecs_to_jiffies(deadline_ms);
+	while (!mutex_trylock(m)) {
+		if (time_after_eq(jiffies, deadline)) {
+			pr_warn_ratelimited(
+				"Phase E3: svm_migrate_to_ram %s timeout > %dms "
+				"(pid=%d addr=0x%lx)\n",
+				name, deadline_ms, current->pid, addr);
+			return false;
+		}
+		/* Yield and retry. Pagefault context is sleepable. */
+		if (need_resched())
+			schedule();
+		else
+			usleep_range(100, 500);
+	}
+	return true;
+}
+
 /**
  * svm_migrate_to_ram - CPU page fault handler
  * @vmf: CPU vm fault vma, address
@@ -993,7 +1041,12 @@ static vm_fault_t svm_migrate_to_ram(struct vm_fault *vmf)
 	pr_debug("CPU page fault svms 0x%p address 0x%lx\n", &p->svms, addr);
 	addr >>= PAGE_SHIFT;
 
-	mutex_lock(&p->svms.lock);
+	/* V17.5 Phase E3: bounded wait on per-process svms lock. */
+	if (!kfd_e3_mutex_lock_deadline(&p->svms.lock, "svms.lock",
+					vmf->address)) {
+		r = -EBUSY;
+		goto out_unref_process;
+	}
 
 	prange = svm_range_from_addr(&p->svms, addr, NULL);
 	if (!prange) {
@@ -1002,7 +1055,13 @@ static vm_fault_t svm_migrate_to_ram(struct vm_fault *vmf)
 		goto out_unlock_svms;
 	}
 
-	mutex_lock(&prange->migrate_mutex);
+	/* V17.5 Phase E3: bounded wait on per-range migrate mutex. */
+	if (!kfd_e3_mutex_lock_deadline(&prange->migrate_mutex,
+					"prange->migrate_mutex",
+					vmf->address)) {
+		r = -EBUSY;
+		goto out_unlock_svms;
+	}
 
 	if (!prange->actual_loc)
 		goto out_unlock_prange;
@@ -1034,6 +1093,8 @@ static const struct dev_pagemap_ops svm_migrate_pgmap_ops = {
 	.page_free		= svm_migrate_page_free,
 	.migrate_to_ram		= svm_migrate_to_ram,
 };
+
+/* end of Phase E3 region — keep grouped for ease of cherry-pick */
 
 /* Each VRAM page uses sizeof(struct page) on system memory */
 #define SVM_HMM_PAGE_STRUCT_SIZE(size) ((size)/PAGE_SIZE * sizeof(struct page))

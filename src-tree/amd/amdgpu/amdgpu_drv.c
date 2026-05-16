@@ -1070,6 +1070,29 @@ MODULE_PARM_DESC(rdma_pin_max_per_cgroup_mb,
 	"Per-cgroup RDMA pin cap in MB (0=disabled, default 0)");
 
 /**
+ * DOC: kfd_migrate_deadline_ms (int) [V17.5 Phase E3]
+ * Caps the time svm_migrate_to_ram() will block waiting for either
+ * p->svms.lock or prange->migrate_mutex. When the deadline elapses
+ * the CPU page fault handler returns VM_FAULT_SIGBUS instead of
+ * blocking forever, which lets the upstream caller release
+ * mm->mmap_write_lock (typically held via __gup_longterm_locked for
+ * FOLL_LONGTERM pins) and avoids the customer GPU 0 hang signature
+ * seen at hjbog22 (vram_squat wedge in svm_migrate_to_ram while
+ * holding mmap_write_lock).
+ *
+ * Default 4000 ms = 4 s; matches kfd_wait_max_ms_per_wall=5000 minus
+ * 1 s headroom so this cap always fires *before* the KFD survival
+ * WAIT_EVENTS timer hits ret=-62.
+ * Range clamped to [100..60000] at use site.
+ * 0 = legacy infinite wait (debug only; reproduces original hang).
+ */
+int amdgpu_kfd_migrate_deadline_ms = 4000;
+module_param_named(kfd_migrate_deadline_ms,
+		   amdgpu_kfd_migrate_deadline_ms, int, 0644);
+MODULE_PARM_DESC(kfd_migrate_deadline_ms,
+	"Phase E3: cap svm_migrate_to_ram mutex waits in ms (0=infinite, default 4000)");
+
+/**
  * DOC: send_sigterm (int)
  * Send sigterm to HSA process on unhandled exceptions. Default is not to send sigterm
  * but just print errors on dmesg. Setting 1 enables sending sigterm.
