@@ -103,6 +103,23 @@ struct kgd_mem {
 	u32 rdma_quota_pin_count;
 	u64 rdma_quota_bytes;
 	bool rdma_quota_charged;
+
+	/*
+	 * V17.5 Phase D4.1 hotfix: cgroup id at charge time so the drop
+	 * path does not require the owning task to still be alive.
+	 *
+	 * The peerdirect free_callback -> amd_put_pages -> unpin_bo
+	 * chain can run AFTER the owning task has exited; pid_task()
+	 * then returns NULL, the mm-lookup path fails, and
+	 * amdgpu_kfd_cgroup_pin_drop is skipped. Cgroup outlives task,
+	 * so the next pod scheduled to the same cgroup id inherits the
+	 * leaked debt and is wrongly rejected by
+	 * amdgpu_kfd_rdma_quota_cgroup_ok.
+	 *
+	 * Zero = no cached id; fall back to mm-lookup.
+	 * Non-zero = drop against this cg id unconditionally.
+	 */
+	u64 kfd_cg_id_charged;
 };
 
 /* KFD Memory Eviction */
@@ -190,6 +207,8 @@ void amdgpu_kfd_cgroup_pin_table_fini(struct amdgpu_device *adev);
 struct kfd_cgroup_pin_entry *
 amdgpu_kfd_cgroup_pin_charge(struct amdgpu_device *adev,
 			     struct kfd_process *p, u64 bytes);
+void amdgpu_kfd_cgroup_pin_drop_by_id(struct amdgpu_device *adev,
+				      u64 cg_id, u64 bytes);
 void amdgpu_kfd_cgroup_pin_drop(struct amdgpu_device *adev,
 				struct kfd_process *p, u64 bytes);
 u64  amdgpu_kfd_cgroup_pin_bytes(struct amdgpu_device *adev, u64 cg_id);

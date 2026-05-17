@@ -278,8 +278,46 @@ u64 amdgpu_kfd_cgroup_pin_bytes(struct amdgpu_device *adev, u64 cg_id)
 	read_unlock(&adev->kfd.cgroup_pin_table.lock);
 	return v;
 }
+/*
+ * V17.5 Phase D4.1 hotfix: drop variant that takes cg id directly.
+ *
+ * Caller stashed kgd_mem->kfd_cg_id_charged at charge time and uses
+ * it here so the drop succeeds even if the owning task has already
+ * exited (the common case for peerdirect free_callback racing with
+ * pinner process teardown).
+ *
+ * This intentionally updates ONLY the per-cgroup counter (the one
+ * used by amdgpu_kfd_rdma_quota_cgroup_ok for enforcement). The
+ * per-process kfd_memcg_pinned_bytes counter is best-effort and is
+ * skipped when the owner can no longer be resolved, which is a
+ * /proc-visibility cosmetic loss rather than a functional bug.
+ */
+void amdgpu_kfd_cgroup_pin_drop_by_id(struct amdgpu_device *adev,
+				      u64 cg_id, u64 bytes)
+{
+	struct kfd_cgroup_pin_entry *e;
+	s64 cur, want;
+
+	if (!cg_id || !bytes)
+		return;
+
+	e = kfd_cgroup_pin_get_or_alloc(&adev->kfd.cgroup_pin_table, cg_id);
+	if (!e)
+		return;
+
+	for (;;) {
+		cur = atomic64_read(&e->bytes);
+		want = cur - (s64)bytes;
+		if (want < 0)
+			want = 0;
+		if (atomic64_cmpxchg(&e->bytes, cur, want) == cur)
+			break;
+	}
+}
+
 EXPORT_SYMBOL_GPL(amdgpu_kfd_cgroup_pin_charge);
 EXPORT_SYMBOL_GPL(amdgpu_kfd_cgroup_pin_drop);
+EXPORT_SYMBOL_GPL(amdgpu_kfd_cgroup_pin_drop_by_id);
 EXPORT_SYMBOL_GPL(amdgpu_kfd_cgroup_pin_bytes);
 
 /*
@@ -2064,6 +2102,16 @@ int amdgpu_amdkfd_gpuvm_pin_bo(struct amdgpu_bo *bo, u32 domain)
 		}
 		if (owner) {
 			amdgpu_kfd_cgroup_pin_charge(adev, owner, bo_size);
+			/*
+			 * V17.5 Phase D4.1 hotfix: stash cg id so the drop
+			 * path can succeed even after this task exits.
+			 * Refresh on every successful charge so a process
+			 * that migrated cgroups still drops against the
+			 * latest one.
+			 */
+			if (owner->kfd_memcg_id)
+				kgd_mem->kfd_cg_id_charged =
+					owner->kfd_memcg_id;
 			kfd_unref_process(owner);
 		}
 	}
@@ -2196,11 +2244,21 @@ void amdgpu_amdkfd_gpuvm_unpin_bo(struct amdgpu_bo *bo)
 	}
 
 	/*
-	 * V17.5 Phase D1: drop the per-cgroup counter. Mirrors the charge
-	 * site in amdgpu_amdkfd_gpuvm_pin_bo. We must drop bytes for ANY
-	 * memory type (VRAM or GTT) since pin charged for any pin.
+	 * V17.5 Phase D1 + D4.1: drop the per-cgroup counter. Mirrors the
+	 * charge site in amdgpu_amdkfd_gpuvm_pin_bo. We must drop bytes
+	 * for ANY memory type (VRAM or GTT) since pin charged for any pin.
+	 *
+	 * D4.1 hotfix: prefer the cg id we cached on kgd_mem at charge
+	 * time. The owning task may have already exited by the time the
+	 * peerdirect free_callback drives this unpin (the common case);
+	 * pid_task() then returns NULL and the mm-lookup path silently
+	 * skips the drop, stranding bytes on the per-cgroup counter and
+	 * poisoning the next pod scheduled to the same cgroup id.
 	 */
-	if (kgd_mem && kgd_mem->process_info) {
+	if (kgd_mem && kgd_mem->kfd_cg_id_charged) {
+		amdgpu_kfd_cgroup_pin_drop_by_id(adev,
+			kgd_mem->kfd_cg_id_charged, amdgpu_bo_size(bo));
+	} else if (kgd_mem && kgd_mem->process_info) {
 		struct kfd_process *owner = NULL;
 		struct pid *opid = kgd_mem->process_info->pid;
 		struct task_struct *otask;
