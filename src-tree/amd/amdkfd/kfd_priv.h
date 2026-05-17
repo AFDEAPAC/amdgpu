@@ -1121,8 +1121,21 @@ struct kfd_process {
 	/*Is the user space process 32 bit?*/
 	bool is_32bit_user_mode;
 
-	/* Event-related data */
-	struct mutex event_mutex;
+	/* Event-related data.
+	 *
+	 * V17.5-rc7 F-A+: converted from struct mutex to struct rw_semaphore.
+	 * Wait paths (kfd_wait_on_events init + finalize) take down_read so
+	 * concurrent waiters from different threads on different events can
+	 * proceed in parallel. Create / destroy / criu / debug / dqm paths
+	 * keep exclusive write access via down_write so IDR / signal_page /
+	 * signal_event_count remain consistent.
+	 *
+	 * The KFD_SHARD_F_A_EVENT_MUTEX kill-switch bit (kfd_lock_shard_mask
+	 * bit 0) gates which mode the wait paths use:
+	 *   bit set (default): waiters take down_read (parallel)
+	 *   bit clear        : waiters take down_write (mutex-equivalent)
+	 */
+	struct rw_semaphore event_mutex;
 	/* Event ID allocator and lookup */
 	struct idr event_idr;
 	/* Event page */

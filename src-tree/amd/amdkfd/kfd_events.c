@@ -262,7 +262,8 @@ int kfd_event_init_process(struct kfd_process *p)
 {
 	int id;
 
-	mutex_init(&p->event_mutex);
+	/* V17.5-rc7 F-A+: rwsem so concurrent waiters can run in parallel */
+	init_rwsem(&p->event_mutex);
 	idr_init(&p->event_idr);
 	p->signal_page = NULL;
 	p->signal_event_count = 1;
@@ -272,10 +273,51 @@ int kfd_event_init_process(struct kfd_process *p)
 	id = idr_alloc(&p->event_idr, NULL, 0, 1, GFP_KERNEL);
 	if (id < 0) {
 		idr_destroy(&p->event_idr);
-		mutex_destroy(&p->event_mutex);
+		/* rwsem has no explicit destroy */
 		return id;
 	}
 	return 0;
+}
+
+/* V17.5-rc7 F-A+ helpers for the wait path.
+ *
+ * kfd_wait_on_events takes the event_mutex twice (init waiters + finalize).
+ * Both can run as down_read because they only need to exclude concurrent
+ * event create / destroy on the SAME process; multiple readers (concurrent
+ * waiters on different events from different threads) are safe because
+ * init_event_waiter mutates per-event ev->lock (already serialised) and
+ * waitqueue head (waitqueue_lock is internal).
+ *
+ * The kill-switch bit KFD_SHARD_F_A_EVENT_MUTEX (kfd_lock_shard_mask bit 0)
+ * controls whether we take down_read (parallel; default) or down_write
+ * (serial; mutex-equivalent legacy behaviour) on the wait paths.
+ *
+ * The is_read bit is captured at lock acquisition time and passed through
+ * to the matching unlock so a mid-flight modparam flip cannot pair an
+ * up_read with a down_write or vice versa.
+ */
+struct kfd_evtwait_lock_ctx {
+	bool is_read;
+};
+
+static inline void kfd_event_wait_lock_init(struct kfd_process *p,
+					    struct kfd_evtwait_lock_ctx *ctx)
+{
+	ctx->is_read = !!(amdgpu_kfd_lock_shard_mask &
+			  KFD_SHARD_F_A_EVENT_MUTEX);
+	if (ctx->is_read)
+		down_read(&p->event_mutex);
+	else
+		down_write(&p->event_mutex);
+}
+
+static inline void kfd_event_wait_lock_release(struct kfd_process *p,
+					       struct kfd_evtwait_lock_ctx *ctx)
+{
+	if (ctx->is_read)
+		up_read(&p->event_mutex);
+	else
+		up_write(&p->event_mutex);
 }
 
 static void destroy_event(struct kfd_process *p, struct kfd_event *ev)
@@ -310,7 +352,7 @@ static void destroy_events(struct kfd_process *p)
 		if (ev)
 			destroy_event(p, ev);
 	idr_destroy(&p->event_idr);
-	mutex_destroy(&p->event_mutex);
+	/* V17.5-rc7 F-A+: rwsem has no explicit destroy */
 }
 
 /*
@@ -436,7 +478,8 @@ int kfd_event_create(struct file *devkfd, struct kfd_process *p,
 
 	*event_page_offset = 0;
 
-	mutex_lock(&p->event_mutex);
+	/* V17.5-rc7 F-A+: write exclusive; mutates event_idr + signal_page */
+	down_write(&p->event_mutex);
 
 	switch (event_type) {
 	case KFD_EVENT_TYPE_SIGNAL:
@@ -460,7 +503,7 @@ int kfd_event_create(struct file *devkfd, struct kfd_process *p,
 		kfree(ev);
 	}
 
-	mutex_unlock(&p->event_mutex);
+	up_write(&p->event_mutex);  /* V17.5-rc7 F-A+ */
 
 	return ret;
 }
@@ -510,7 +553,8 @@ int kfd_criu_restore_event(struct file *devkfd,
 	spin_lock_init(&ev->lock);
 	init_waitqueue_head(&ev->wq);
 
-	mutex_lock(&p->event_mutex);
+	/* V17.5-rc7 F-A+: write exclusive (criu IDR restore) */
+	down_write(&p->event_mutex);
 	switch (ev->type) {
 	case KFD_EVENT_TYPE_SIGNAL:
 	case KFD_EVENT_TYPE_DEBUG:
@@ -531,7 +575,7 @@ int kfd_criu_restore_event(struct file *devkfd,
 		ret = create_other_event(p, ev, &ev_priv->event_id);
 		break;
 	}
-	mutex_unlock(&p->event_mutex);
+	up_write(&p->event_mutex);  /* V17.5-rc7 F-A+ */
 
 exit:
 	if (ret)
@@ -631,7 +675,8 @@ int kfd_event_destroy(struct kfd_process *p, uint32_t event_id)
 	struct kfd_event *ev;
 	int ret = 0;
 
-	mutex_lock(&p->event_mutex);
+	/* V17.5-rc7 F-A+: write exclusive (idr_remove + signal_event_count--) */
+	down_write(&p->event_mutex);
 
 	ev = lookup_event_by_id(p, event_id);
 
@@ -640,7 +685,7 @@ int kfd_event_destroy(struct kfd_process *p, uint32_t event_id)
 	else
 		ret = -EINVAL;
 
-	mutex_unlock(&p->event_mutex);
+	up_write(&p->event_mutex);
 	return ret;
 }
 
@@ -975,6 +1020,14 @@ int kfd_wait_on_events(struct kfd_process *p,
 
 	struct kfd_event_waiter *event_waiters = NULL;
 	long timeout = user_timeout_to_jiffies(*user_timeout_ms);
+	/* V17.5-rc7 F-A+: per-acquisition lock-mode context. ctx_a is used
+	 * by the pre-sleep init section; ctx_b is used by the post-sleep
+	 * finalize section. The out_unlock label releases whichever lock
+	 * is currently held by consulting cur_ctx_held.
+	 */
+	struct kfd_evtwait_lock_ctx ctx_a = { .is_read = false };
+	struct kfd_evtwait_lock_ctx ctx_b = { .is_read = false };
+	struct kfd_evtwait_lock_ctx *cur_ctx_held = NULL;
 
 	event_waiters = alloc_event_waiters(num_events);
 	if (!event_waiters) {
@@ -984,8 +1037,14 @@ int kfd_wait_on_events(struct kfd_process *p,
 
 	/* Use p->event_mutex here to protect against concurrent creation and
 	 * destruction of events while we initialize event_waiters.
+	 *
+	 * V17.5-rc7 F-A+: shared lock (down_read) by default so concurrent
+	 * waiters from different threads on different events can run in
+	 * parallel. Exclusive lock (down_write) when bit 0 of
+	 * kfd_lock_shard_mask is cleared (mutex-equivalent fallback).
 	 */
-	mutex_lock(&p->event_mutex);
+	kfd_event_wait_lock_init(p, &ctx_a);
+	cur_ctx_held = &ctx_a;
 
 	for (i = 0; i < num_events; i++) {
 		struct kfd_event_data event_data;
@@ -1014,7 +1073,8 @@ int kfd_wait_on_events(struct kfd_process *p,
 		goto out_unlock;
 	}
 
-	mutex_unlock(&p->event_mutex);
+	kfd_event_wait_lock_release(p, &ctx_a);  /* V17.5-rc7 F-A+ */
+	cur_ctx_held = NULL;
 
 	/* V17.4 #4 P0: anchor for the absolute deadline used by the
 	 * INFINITE-timeout path so a permanently stuck GPU returns
@@ -1121,7 +1181,9 @@ int kfd_wait_on_events(struct kfd_process *p,
 	}
 	__set_current_state(TASK_RUNNING);
 
-	mutex_lock(&p->event_mutex);
+	/* V17.5-rc7 F-A+: re-acquire for post-sleep finalize section. */
+	kfd_event_wait_lock_init(p, &ctx_b);
+	cur_ctx_held = &ctx_b;
 	/* copy_signaled_event_data may sleep. So this has to happen
 	 * after the task state is set back to RUNNING.
 	 *
@@ -1136,7 +1198,8 @@ int kfd_wait_on_events(struct kfd_process *p,
 
 out_unlock:
 	free_waiters(num_events, event_waiters, ret == -ERESTARTSYS);
-	mutex_unlock(&p->event_mutex);
+	if (cur_ctx_held)
+		kfd_event_wait_lock_release(p, cur_ctx_held);  /* V17.5-rc7 F-A+ */
 out:
 	if (ret)
 		*wait_result = KFD_IOC_WAIT_RESULT_FAIL;
