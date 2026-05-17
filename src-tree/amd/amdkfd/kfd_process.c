@@ -66,8 +66,30 @@ static struct workqueue_struct *kfd_process_wq;
  * pressure can lead to processes blocking each other from validating
  * their BOs and result in a live-lock situation where processes
  * remain evicted indefinitely.
+ *
+ * V17.5-rc7 F-3: this global wq remains as a fallback. When the kill-switch
+ * bit KFD_SHARD_F_3_RESTORE_WQ is set AND p->restore_wq was successfully
+ * allocated at process creation, p->restore_wq is used instead, eliminating
+ * cross-process FIFO serialisation between independent kfd_processes (e.g.
+ * vLLM + torch_service mix on the same host).
  */
 static struct workqueue_struct *kfd_restore_wq;
+
+/* V17.5-rc7 F-3: choose between per-process restore_wq and the legacy
+ * system-wide kfd_restore_wq.  Returns p->restore_wq only when:
+ *   (1) the F-3 kill-switch bit is set in amdgpu_kfd_lock_shard_mask, AND
+ *   (2) the per-process wq was allocated successfully (non-NULL).
+ * Otherwise returns the legacy global kfd_restore_wq.  This keeps the
+ * shard fully runtime-disablable via /sys/module/amdgpu/parameters/kfd_lock_shard_mask.
+ */
+static inline struct workqueue_struct *
+kfd_pick_restore_wq(struct kfd_process *p)
+{
+	if ((amdgpu_kfd_lock_shard_mask & KFD_SHARD_F_3_RESTORE_WQ) &&
+	    p->restore_wq)
+		return p->restore_wq;
+	return kfd_restore_wq;
+}
 
 static struct kfd_process *find_process(const struct task_struct *thread,
 					bool ref);
@@ -1251,6 +1273,16 @@ static void kfd_process_wq_release(struct work_struct *work)
 
 	kfd_event_free_process(p);
 
+	/* V17.5-rc7 F-3: tear down per-process restore_wq if it was
+	 * allocated. cancel_delayed_work_sync(&p->restore_work) already
+	 * ran in kfd_process_notifier_release_internal(), so no work is
+	 * in flight; destroy_workqueue() returns immediately.
+	 */
+	if (p->restore_wq) {
+		destroy_workqueue(p->restore_wq);
+		p->restore_wq = NULL;
+	}
+
 	mutex_destroy(&p->mutex);
 
 	/*
@@ -1701,6 +1733,25 @@ static struct kfd_process *create_process(const struct task_struct *thread)
 
 	INIT_DELAYED_WORK(&process->eviction_work, evict_process_worker);
 	INIT_DELAYED_WORK(&process->restore_work, restore_process_worker);
+
+	/* V17.5-rc7 F-3: per-process ordered workqueue for restore_work.
+	 * Failure is non-fatal; kfd_restore_process_queues falls back to the
+	 * legacy system-wide kfd_restore_wq when restore_wq is NULL.
+	 */
+	if (amdgpu_kfd_lock_shard_mask & KFD_SHARD_F_3_RESTORE_WQ) {
+		char wq_name[32];
+
+		snprintf(wq_name, sizeof(wq_name), "kfd_restore_%d",
+			 process->lead_thread ?
+			 (int)task_pid_nr(process->lead_thread) : 0);
+		process->restore_wq = alloc_ordered_workqueue(wq_name,
+							      WQ_FREEZABLE);
+		if (!process->restore_wq)
+			dev_warn(NULL, "kfd: F-3 per-process restore_wq alloc failed for pid=%d; falling back to global kfd_restore_wq\n",
+				 process->lead_thread ?
+				 (int)task_pid_nr(process->lead_thread) : 0);
+	}
+
 	process->last_restore_timestamp = get_jiffies_64();
 	err = kfd_event_init_process(process);
 	if (err)
@@ -2280,7 +2331,8 @@ void kfd_process_schedule_restore(struct kfd_process *p)
 		delay_jiffies = 0;
 
 	pr_debug("Process pid %d schedule restore work\n", p->lead_thread->pid);
-	if (mod_delayed_work(kfd_restore_wq, &p->restore_work, delay_jiffies))
+	/* V17.5-rc7 F-3: per-process wq when shard bit set, else legacy global */
+	if (mod_delayed_work(kfd_pick_restore_wq(p), &p->restore_work, delay_jiffies))
 		kfd_process_restore_queues(p);
 }
 
@@ -2381,7 +2433,8 @@ static void evict_process_worker(struct work_struct *work)
 		 * the restore work.
 		 */
 		if (signal_eviction_fence(p) ||
-		    mod_delayed_work(kfd_restore_wq, &p->restore_work,
+		    /* V17.5-rc7 F-3: per-process wq when shard bit set */
+		    mod_delayed_work(kfd_pick_restore_wq(p), &p->restore_work,
 				     msecs_to_jiffies(PROCESS_RESTORE_TIME_MS)))
 			kfd_process_restore_queues(p);
 
@@ -2452,7 +2505,8 @@ static void restore_process_worker(struct work_struct *work)
 	if (ret) {
 		pr_debug("Failed to restore BOs of process pid %d, retry after %d ms\n",
 			 p->lead_thread->pid, PROCESS_BACK_OFF_TIME_MS);
-		if (mod_delayed_work(kfd_restore_wq, &p->restore_work,
+		/* V17.5-rc7 F-3: per-process wq when shard bit set */
+		if (mod_delayed_work(kfd_pick_restore_wq(p), &p->restore_work,
 				     msecs_to_jiffies(PROCESS_RESTORE_TIME_MS)))
 			kfd_process_restore_queues(p);
 		trace_kfd_restore_process_worker_end(p, ret ?

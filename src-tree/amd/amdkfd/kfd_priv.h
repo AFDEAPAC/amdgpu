@@ -224,6 +224,22 @@ extern bool keep_idle_process_evicted;
 extern bool debug_evictions;
 
 /*
+ * V17.5-rc7 lock-shard kill-switch bitmask. See amdgpu_drv.c
+ * MODULE_PARM_DESC(kfd_lock_shard_mask) for the bit definitions.
+ *   bit 0 = F-A (per-pdd event_wait_mutex)
+ *   bit 1 = F-B (process_info rwsem split)
+ *   bit 2 = F-2' (chunked alloc + cond_resched)
+ *   bit 3 = F-3 (per-process restore_wq)
+ * Default 0xF (all shards enabled). Read at hot-path entry only.
+ */
+extern unsigned int amdgpu_kfd_lock_shard_mask;
+extern unsigned int amdgpu_kfd_bo_chunk_bytes;
+#define KFD_SHARD_F_A_EVENT_MUTEX  BIT(0)
+#define KFD_SHARD_F_B_PROCESS_INFO BIT(1)
+#define KFD_SHARD_F_2P_ALLOC_CHUNK BIT(2)
+#define KFD_SHARD_F_3_RESTORE_WQ   BIT(3)
+
+/*
  * V17.5 Phase C: pin user-space CWSR SVM pages so kernel reclaim cannot
  * trigger MMU_NOTIFY_UNMAP and quiesce the compute queue.
  *   kfd_pin_queue_svm_pages   - master toggle (default: 1)
@@ -866,6 +882,8 @@ struct kfd_process_device {
 	/* The device that owns this data. */
 	struct kfd_node *dev;
 
+
+
 	/* The process that owns this kfd_process_device. */
 	struct kfd_process *process;
 
@@ -1108,6 +1126,13 @@ struct kfd_process {
 	/* Work items for evicting and restoring BOs */
 	struct delayed_work eviction_work;
 	struct delayed_work restore_work;
+	/* V17.5-rc7 F-3: per-process ordered workqueue for restore_work.
+	 * When non-NULL (and kfd_lock_shard_mask bit 3 is set), restore_work
+	 * is queued onto this per-process ordered wq instead of the legacy
+	 * system-wide kfd_restore_wq, eliminating cross-process FIFO blocking
+	 * during queue-restore work under memory pressure (vLLM-style hosts).
+	 */
+	struct workqueue_struct *restore_wq;
 	/* seqno of the last scheduled eviction */
 	unsigned int last_eviction_seqno;
 	/* Approx. the last timestamp (in jiffies) when the process was

@@ -843,6 +843,39 @@ MODULE_PARM_DESC(dmabuf_pin_max_mb,
 	"Max VRAM pinned for RDMA/PeerDirect per GPU in MB (0 = unlimited (default))");
 
 /**
+ * DOC: kfd_lock_shard_mask (uint) [V17.5-rc7 lock-shard]
+ * Bitmask kill-switch for the amdgpu/amdkfd lock-shard reorganisation. Each
+ * bit corresponds to one independent shard; bit set => sharded behaviour,
+ * bit clear => fall back to the legacy single-lock/single-wq path.
+ *
+ *   bit 0 (0x1) = F-A : per-pdd event_wait_mutex (kfd_wait_on_events shard)
+ *   bit 1 (0x2) = F-B : amdkfd_process_info.lock mutex -> rwsem conversion
+ *   bit 2 (0x4) = F-2': amdgpu_amdkfd_gpuvm chunked alloc + cond_resched
+ *   bit 3 (0x8) = F-3 : per-kfd_process restore workqueue (vs system-wide)
+ *
+ * Default 0xF (all shards enabled). Setting 0 reverts the loaded driver to
+ * pre-shard behaviour at runtime without rebuild. Read/write at 0644 so SREs
+ * can flip individual bits via /sys/module/amdgpu/parameters/kfd_lock_shard_mask.
+ */
+unsigned int amdgpu_kfd_lock_shard_mask = 0xF;
+module_param_named(kfd_lock_shard_mask, amdgpu_kfd_lock_shard_mask, uint, 0644);
+MODULE_PARM_DESC(kfd_lock_shard_mask,
+	"V17.5-rc7 amdkfd lock-shard kill-switch bitmask (bit0=F-A event_mutex, bit1=F-B process_info rwsem, bit2=F-2' alloc chunking, bit3=F-3 per-process restore_wq; default 0xF = all enabled)");
+
+/**
+ * DOC: kfd_bo_chunk_bytes (uint) [V17.5-rc7 lock-shard F-2']
+ * When F-2' is enabled (kfd_lock_shard_mask bit 2), the amdgpu_amdkfd_gpuvm
+ * alloc path splits large BOs into chunks of at most this many bytes,
+ * yielding the CPU between chunks. 0 = disable chunking even if F-2' is
+ * enabled. Default 64 MB matches the customer's median pin size (550 MB
+ * average / 8 chunks per BO).
+ */
+unsigned int amdgpu_kfd_bo_chunk_bytes = 64u << 20;
+module_param_named(kfd_bo_chunk_bytes, amdgpu_kfd_bo_chunk_bytes, uint, 0644);
+MODULE_PARM_DESC(kfd_bo_chunk_bytes,
+	"V17.5-rc7 amdkfd alloc chunk size in bytes (default 64MB = 67108864; 0 = disable chunking)");
+
+/**
  * DOC: dmabuf_reject_new_pins (int)
  * Reject new RDMA/PeerDirect pins (global kill switch).
  */
