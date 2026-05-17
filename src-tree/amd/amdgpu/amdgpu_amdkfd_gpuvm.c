@@ -2070,6 +2070,17 @@ int amdgpu_amdkfd_gpuvm_pin_bo(struct amdgpu_bo *bo, u32 domain)
 		goto out;
 	}
 
+	/* V17.5-rc7 F-2': amdgpu_bo_pin() above can take milliseconds for
+	 * a multi-hundred-MB BO (TTM validate + placement + DMA mapping
+	 * sgtable build).  Yield once after a successful pin so other
+	 * threads (including the WAIT_EVENTS path on neighbour GPUs) can
+	 * make progress before we continue into amdgpu_bo_sync_wait().
+	 */
+	if ((amdgpu_kfd_lock_shard_mask & KFD_SHARD_F_2P_ALLOC_CHUNK) &&
+	    (amdgpu_kfd_bo_chunk_bytes == 0 ||
+	     bo_size >= amdgpu_kfd_bo_chunk_bytes))
+		cond_resched();
+
 	amdgpu_bo_sync_wait(bo, AMDGPU_FENCE_OWNER_KFD, false);
 
 	if (!ret)
@@ -2541,6 +2552,20 @@ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
 			 domain_string(alloc_domain), ret);
 		goto err_bo_create;
 	}
+
+	/* V17.5-rc7 F-2': cooperative yield after the large buddy-allocator
+	 * walk inside amdgpu_gem_object_create -> ttm_bo_init_validate ->
+	 * ttm_pool_alloc.  For a 286 MB GTT BO (customer's mean pin size)
+	 * the buddy walk touches ~73 168 pages and runs for tens of ms;
+	 * without cond_resched() this can serialise concurrent KFD ioctls
+	 * from other processes that are waiting for CPU.  Gated by
+	 * KFD_SHARD_F_2P_ALLOC_CHUNK; threshold from kfd_bo_chunk_bytes
+	 * (0 = always yield once we got here, default 64 MB).
+	 */
+	if ((amdgpu_kfd_lock_shard_mask & KFD_SHARD_F_2P_ALLOC_CHUNK) &&
+	    (amdgpu_kfd_bo_chunk_bytes == 0 ||
+	     aligned_size >= amdgpu_kfd_bo_chunk_bytes))
+		cond_resched();
 	ret = drm_vma_node_allow(&gobj->vma_node, drm_priv);
 	if (ret) {
 		pr_debug("Failed to allow vma node access. ret %d\n", ret);
