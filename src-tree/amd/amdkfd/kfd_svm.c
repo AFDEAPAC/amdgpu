@@ -1870,7 +1870,7 @@ static void svm_range_restore_work(struct work_struct *work)
 		return;
 	}
 
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 	svm_range_list_lock_and_flush_work(svms, mm);
 	mutex_lock(&svms->lock);
 
@@ -1923,7 +1923,7 @@ static void svm_range_restore_work(struct work_struct *work)
 out_reschedule:
 	mutex_unlock(&svms->lock);
 	mmap_write_unlock(mm);
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 
 	/* If validation failed, reschedule another attempt */
 	if (evicted_ranges) {
@@ -3713,7 +3713,7 @@ svm_range_set_attr(struct kfd_process *p, struct mm_struct *mm,
 
 	svms = &p->svms;
 
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 
 	svm_range_list_lock_and_flush_work(svms, mm);
 
@@ -3811,7 +3811,7 @@ out_unlock_range:
 	mutex_unlock(&svms->lock);
 	mmap_read_unlock(mm);
 out:
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 
 	pr_debug("process pid %d svms 0x%p [0x%llx 0x%llx] done, r=%d\n",
 		 p->lead_thread->pid, &p->svms, start, start + size - 1, r);

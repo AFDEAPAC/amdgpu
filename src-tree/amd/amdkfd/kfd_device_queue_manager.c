@@ -3514,7 +3514,7 @@ int suspend_queues(struct kfd_process *p,
 		struct queue *q;
 		int r, per_device_suspended = 0;
 
-		mutex_lock(&p->event_mutex);
+		down_write(&p->event_mutex) /* V17.5-rc7 F-A+ */;
 		dqm_lock(dqm);
 
 		/* unmask queues that suspend or already suspended */
@@ -3547,7 +3547,7 @@ int suspend_queues(struct kfd_process *p,
 
 		if (!per_device_suspended) {
 			dqm_unlock(dqm);
-			mutex_unlock(&p->event_mutex);
+			up_write(&p->event_mutex) /* V17.5-rc7 F-A+ */;
 			if (total_suspended)
 				amdgpu_amdkfd_debug_mem_fence(dqm->dev->adev);
 			continue;
@@ -3578,7 +3578,7 @@ int suspend_queues(struct kfd_process *p,
 		}
 
 		dqm_unlock(dqm);
-		mutex_unlock(&p->event_mutex);
+		up_write(&p->event_mutex) /* V17.5-rc7 F-A+ */;
 		amdgpu_device_flush_hdp(dqm->dev->adev, NULL);
 	}
 

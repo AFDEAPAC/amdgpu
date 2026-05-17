@@ -224,6 +224,22 @@ extern bool keep_idle_process_evicted;
 extern bool debug_evictions;
 
 /*
+ * V17.5-rc7 lock-shard kill-switch bitmask. See amdgpu_drv.c
+ * MODULE_PARM_DESC(kfd_lock_shard_mask) for the bit definitions.
+ *   bit 0 = F-A (per-pdd event_wait_mutex)
+ *   bit 1 = F-B (process_info rwsem split)
+ *   bit 2 = F-2' (chunked alloc + cond_resched)
+ *   bit 3 = F-3 (per-process restore_wq)
+ * Default 0xF (all shards enabled). Read at hot-path entry only.
+ */
+extern unsigned int amdgpu_kfd_lock_shard_mask;
+extern unsigned int amdgpu_kfd_bo_chunk_bytes;
+#define KFD_SHARD_F_A_EVENT_MUTEX  BIT(0)
+#define KFD_SHARD_F_B_PROCESS_INFO BIT(1)
+#define KFD_SHARD_F_2P_ALLOC_CHUNK BIT(2)
+#define KFD_SHARD_F_3_RESTORE_WQ   BIT(3)
+
+/*
  * V17.5 Phase C: pin user-space CWSR SVM pages so kernel reclaim cannot
  * trigger MMU_NOTIFY_UNMAP and quiesce the compute queue.
  *   kfd_pin_queue_svm_pages   - master toggle (default: 1)
@@ -866,6 +882,31 @@ struct kfd_process_device {
 	/* The device that owns this data. */
 	struct kfd_node *dev;
 
+	/* V17.5-rc7 F-A: per-pdd event-wait mutex (placeholder).
+	 *
+	 * Currently the per-process kfd_process->event_mutex protects
+	 * event_idr, signal_page, signal_event_count and the
+	 * kfd_wait_on_events critical sections.  Within a single process
+	 * spanning multiple GPUs (vLLM TP4) this serialises every GPU's
+	 * event operations onto one mutex.
+	 *
+	 * NVIDIA's per-FD nv_linux_file_private_t gives each GPU its own
+	 * event/signal state automatically; AMD's per-process kfd_process
+	 * cannot do that without changing IPC semantics (signal_page is
+	 * per-process by design).
+	 *
+	 * This field is the staging point for future per-GPU event-state
+	 * migration.  In this initial F-A scaffold patch it is initialised
+	 * but NOT yet used as the active lock for any site -- the
+	 * KFD_SHARD_F_A_EVENT_MUTEX kill-switch bit is reserved.
+	 *
+	 * A follow-up patch may migrate selected fast-path sites (e.g. the
+	 * kfd_wait_on_events init-waiter section when all targeted events
+	 * resolve to the same pdd) to take pdd->event_wait_mutex instead.
+	 */
+	struct mutex event_wait_mutex;
+
+
 	/* The process that owns this kfd_process_device. */
 	struct kfd_process *process;
 
@@ -1080,8 +1121,21 @@ struct kfd_process {
 	/*Is the user space process 32 bit?*/
 	bool is_32bit_user_mode;
 
-	/* Event-related data */
-	struct mutex event_mutex;
+	/* Event-related data.
+	 *
+	 * V17.5-rc7 F-A+: converted from struct mutex to struct rw_semaphore.
+	 * Wait paths (kfd_wait_on_events init + finalize) take down_read so
+	 * concurrent waiters from different threads on different events can
+	 * proceed in parallel. Create / destroy / criu / debug / dqm paths
+	 * keep exclusive write access via down_write so IDR / signal_page /
+	 * signal_event_count remain consistent.
+	 *
+	 * The KFD_SHARD_F_A_EVENT_MUTEX kill-switch bit (kfd_lock_shard_mask
+	 * bit 0) gates which mode the wait paths use:
+	 *   bit set (default): waiters take down_read (parallel)
+	 *   bit clear        : waiters take down_write (mutex-equivalent)
+	 */
+	struct rw_semaphore event_mutex;
 	/* Event ID allocator and lookup */
 	struct idr event_idr;
 	/* Event page */
@@ -1108,6 +1162,13 @@ struct kfd_process {
 	/* Work items for evicting and restoring BOs */
 	struct delayed_work eviction_work;
 	struct delayed_work restore_work;
+	/* V17.5-rc7 F-3: per-process ordered workqueue for restore_work.
+	 * When non-NULL (and kfd_lock_shard_mask bit 3 is set), restore_work
+	 * is queued onto this per-process ordered wq instead of the legacy
+	 * system-wide kfd_restore_wq, eliminating cross-process FIFO blocking
+	 * during queue-restore work under memory pressure (vLLM-style hosts).
+	 */
+	struct workqueue_struct *restore_wq;
 	/* seqno of the last scheduled eviction */
 	unsigned int last_eviction_seqno;
 	/* Approx. the last timestamp (in jiffies) when the process was
@@ -1187,6 +1248,28 @@ struct kfd_process {
 	atomic_t pinned_svm_ranges;
 	struct attribute attr_pinned_svm_bytes;
 	struct attribute attr_pinned_svm_ranges;
+
+	/*
+	 * V17.5 Phase D1: memcg pointer captured at kfd_create_process()
+	 * time. Used by amdgpu_amdkfd_gpuvm pin/drop sites and by the
+	 * cgroup-aware TTM victim selector (Phase D2). NULL if the
+	 * process is in the root memcg or if CONFIG_MEMCG is off.
+	 *
+	 * Lifetime: borrowed reference. We pin the cgroup via css_get()
+	 * at capture and put it on kfd_process release. kfd_memcg_id is
+	 * a stable snapshot of css->id for sysfs and for the cgroup_pin
+	 * hash key (memcg pointer can move on cgroup migration; the id
+	 * is the durable handle).
+	 */
+	struct mem_cgroup *kfd_memcg;
+	u64 kfd_memcg_id;
+	atomic64_t kfd_memcg_pinned_bytes;     /* bytes pinned from this process */
+	atomic64_t kfd_memcg_cross_evict_avoided;  /* D2 counter */
+	atomic64_t kfd_memcg_cross_evict_forced;   /* D2 counter */
+	atomic64_t kfd_memcg_queue_evict_avoided;  /* D3 counter */
+	struct attribute attr_kfd_memcg_id;
+	struct attribute attr_kfd_memcg_pinned;
+	struct attribute attr_cgroup_evict_count;
 };
 
 /*

@@ -723,7 +723,7 @@ int pqm_get_queue_snapshot(struct process_queue_manager *pqm,
 		return -EINVAL;
 
 	*entry_size = min_t(size_t, *entry_size, sizeof(struct kfd_queue_snapshot_entry));
-	mutex_lock(&pqm->process->event_mutex);
+	down_write(&pqm->process->event_mutex); /* V17.5-rc7 F-A+ */
 
 	memset(&src, 0, sizeof(src));
 
@@ -743,7 +743,7 @@ int pqm_get_queue_snapshot(struct process_queue_manager *pqm,
 		*num_qss_entries += 1;
 	}
 
-	mutex_unlock(&pqm->process->event_mutex);
+	up_write(&pqm->process->event_mutex); /* V17.5-rc7 F-A+ */
 	return r;
 }
 

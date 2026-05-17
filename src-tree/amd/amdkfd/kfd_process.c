@@ -33,6 +33,8 @@
 #include <linux/mman.h>
 #include <linux/file.h>
 #include <linux/pm_runtime.h>
+#include <linux/memcontrol.h>
+#include <linux/cgroup.h>
 #include "amdgpu_amdkfd.h"
 #include "amdgpu.h"
 #include "amdgpu_reset.h"
@@ -64,8 +66,30 @@ static struct workqueue_struct *kfd_process_wq;
  * pressure can lead to processes blocking each other from validating
  * their BOs and result in a live-lock situation where processes
  * remain evicted indefinitely.
+ *
+ * V17.5-rc7 F-3: this global wq remains as a fallback. When the kill-switch
+ * bit KFD_SHARD_F_3_RESTORE_WQ is set AND p->restore_wq was successfully
+ * allocated at process creation, p->restore_wq is used instead, eliminating
+ * cross-process FIFO serialisation between independent kfd_processes (e.g.
+ * vLLM + torch_service mix on the same host).
  */
 static struct workqueue_struct *kfd_restore_wq;
+
+/* V17.5-rc7 F-3: choose between per-process restore_wq and the legacy
+ * system-wide kfd_restore_wq.  Returns p->restore_wq only when:
+ *   (1) the F-3 kill-switch bit is set in amdgpu_kfd_lock_shard_mask, AND
+ *   (2) the per-process wq was allocated successfully (non-NULL).
+ * Otherwise returns the legacy global kfd_restore_wq.  This keeps the
+ * shard fully runtime-disablable via /sys/module/amdgpu/parameters/kfd_lock_shard_mask.
+ */
+static inline struct workqueue_struct *
+kfd_pick_restore_wq(struct kfd_process *p)
+{
+	if ((amdgpu_kfd_lock_shard_mask & KFD_SHARD_F_3_RESTORE_WQ) &&
+	    p->restore_wq)
+		return p->restore_wq;
+	return kfd_restore_wq;
+}
 
 static struct kfd_process *find_process(const struct task_struct *thread,
 					bool ref);
@@ -344,6 +368,26 @@ static ssize_t kfd_procfs_show(struct kobject *kobj, struct attribute *attr,
 						     attr_pinned_svm_ranges);
 		return snprintf(buffer, PAGE_SIZE, "%d\n",
 				atomic_read(&p->pinned_svm_ranges));
+	} else if (strcmp(attr->name, "cgroup_id") == 0) {
+		struct kfd_process *p = container_of(attr, struct kfd_process,
+						     attr_kfd_memcg_id);
+		return snprintf(buffer, PAGE_SIZE, "%llu\n",
+				(unsigned long long)p->kfd_memcg_id);
+	} else if (strcmp(attr->name, "cgroup_pinned_bytes") == 0) {
+		struct kfd_process *p = container_of(attr, struct kfd_process,
+						     attr_kfd_memcg_pinned);
+		return snprintf(buffer, PAGE_SIZE, "%lld\n",
+				(long long)atomic64_read(&p->kfd_memcg_pinned_bytes));
+	} else if (strcmp(attr->name, "cgroup_evict_count") == 0) {
+		struct kfd_process *p = container_of(attr, struct kfd_process,
+						     attr_cgroup_evict_count);
+		return snprintf(buffer, PAGE_SIZE,
+				"cross_evict_avoided=%lld\n"
+				"cross_evict_forced=%lld\n"
+				"queue_evict_avoided=%lld\n",
+				(long long)atomic64_read(&p->kfd_memcg_cross_evict_avoided),
+				(long long)atomic64_read(&p->kfd_memcg_cross_evict_forced),
+				(long long)atomic64_read(&p->kfd_memcg_queue_evict_avoided));
 	} else if (strncmp(attr->name, "vram_", 5) == 0) {
 		struct kfd_process_device *pdd = container_of(attr, struct kfd_process_device,
 							      attr_vram);
@@ -897,6 +941,17 @@ struct kfd_process *kfd_create_process(struct task_struct *thread)
 				      &process->attr_pinned_svm_ranges,
 				      "pinned_svm_ranges");
 
+		/* V17.5 Phase D1/D3 visibility */
+		kfd_sysfs_create_file(process->kobj,
+				      &process->attr_kfd_memcg_id,
+				      "cgroup_id");
+		kfd_sysfs_create_file(process->kobj,
+				      &process->attr_kfd_memcg_pinned,
+				      "cgroup_pinned_bytes");
+		kfd_sysfs_create_file(process->kobj,
+				      &process->attr_cgroup_evict_count,
+				      "cgroup_evict_count");
+
 		process->kobj_queues = kobject_create_and_add("queues",
 							process->kobj);
 		if (!process->kobj_queues)
@@ -1093,6 +1148,8 @@ static void kfd_process_destroy_pdds(struct kfd_process *p)
 
 		idr_destroy(&pdd->alloc_idr);
 		mutex_destroy(&pdd->qpd.doorbell_lock);
+		/* V17.5-rc7 F-A: per-pdd event-wait mutex */
+		mutex_destroy(&pdd->event_wait_mutex);
 
 		kfd_free_process_doorbells(pdd->dev->kfd, pdd);
 
@@ -1128,6 +1185,10 @@ static void kfd_process_remove_sysfs(struct kfd_process *p)
 	/* V17.5 Phase C visibility */
 	sysfs_remove_file(p->kobj, &p->attr_pinned_svm_bytes);
 	sysfs_remove_file(p->kobj, &p->attr_pinned_svm_ranges);
+	/* V17.5 Phase D1/D3 visibility */
+	sysfs_remove_file(p->kobj, &p->attr_kfd_memcg_id);
+	sysfs_remove_file(p->kobj, &p->attr_kfd_memcg_pinned);
+	sysfs_remove_file(p->kobj, &p->attr_cgroup_evict_count);
 	kobject_del(p->kobj_queues);
 	kobject_put(p->kobj_queues);
 	p->kobj_queues = NULL;
@@ -1214,7 +1275,31 @@ static void kfd_process_wq_release(struct work_struct *work)
 
 	kfd_event_free_process(p);
 
+	/* V17.5-rc7 F-3: tear down per-process restore_wq if it was
+	 * allocated. cancel_delayed_work_sync(&p->restore_work) already
+	 * ran in kfd_process_notifier_release_internal(), so no work is
+	 * in flight; destroy_workqueue() returns immediately.
+	 */
+	if (p->restore_wq) {
+		destroy_workqueue(p->restore_wq);
+		p->restore_wq = NULL;
+	}
+
 	mutex_destroy(&p->mutex);
+
+	/*
+	 * V17.5 Phase D1: drop the borrowed memcg css reference we took in
+	 * create_process(). Safe to do without a per-process mutex because
+	 * by the time we reach _wq_release(), p->ref == 0 and no other
+	 * path can observe p->kfd_memcg anymore (sysfs files were torn
+	 * down by kfd_process_remove_sysfs above).
+	 */
+#ifdef CONFIG_MEMCG
+	if (p->kfd_memcg) {
+		css_put(&p->kfd_memcg->css);
+		p->kfd_memcg = NULL;
+	}
+#endif
 
 	put_task_struct(p->lead_thread);
 
@@ -1595,8 +1680,80 @@ static struct kfd_process *create_process(const struct task_struct *thread)
 	process->lead_thread = thread->group_leader;
 	process->n_pdds = 0;
 	process->queues_paused = false;
+
+	/*
+	 * V17.5 Phase D1: capture the memcg this process belongs to so the
+	 * Phase D2 (TTM victim selection) and Phase D3 (KFD queue evict)
+	 * paths can compare cgroups without re-walking task->cgroups every
+	 * time. We hold a borrowed reference via css_get(); released in
+	 * kfd_process_destroy_kfd_thread (see kfd_process_release path).
+	 *
+	 * Falls back to NULL kfd_memcg / id=0 if:
+	 *   - CONFIG_MEMCG is off,
+	 *   - the process is in the root memcg,
+	 *   - mem_cgroup_from_task() returns NULL (kernel-thread context).
+	 * NULL memcg means "no isolation" -- charge/drop paths skip
+	 * per-cgroup accounting and fall back to the global counter.
+	 */
+#ifdef CONFIG_MEMCG
+	{
+		struct mem_cgroup *mc;
+		u64 cgid = 0;
+
+		rcu_read_lock();
+		mc = mem_cgroup_from_task(process->lead_thread);
+		/*
+		 * mem_cgroup_is_root() / root_mem_cgroup are not exported
+		 * for module use on this kernel (5.10.x). Instead we filter
+		 * "root memcg" by its well-known cgroup id == 1: the v1/v2
+		 * root cgroup always carries id 1, every other cgroup gets
+		 * id >= 2 at create time. This is a stable, ABI-safe filter.
+		 */
+		if (mc) {
+			cgid = cgroup_id(mc->css.cgroup);
+			if (cgid > 1 && css_tryget(&mc->css)) {
+				process->kfd_memcg = mc;
+				process->kfd_memcg_id = cgid;
+			} else {
+				process->kfd_memcg = NULL;
+				process->kfd_memcg_id = 0;
+			}
+		} else {
+			process->kfd_memcg = NULL;
+			process->kfd_memcg_id = 0;
+		}
+		rcu_read_unlock();
+	}
+#else
+	process->kfd_memcg = NULL;
+	process->kfd_memcg_id = 0;
+#endif
+	atomic64_set(&process->kfd_memcg_pinned_bytes, 0);
+	atomic64_set(&process->kfd_memcg_cross_evict_avoided, 0);
+	atomic64_set(&process->kfd_memcg_cross_evict_forced, 0);
+	atomic64_set(&process->kfd_memcg_queue_evict_avoided, 0);
+
 	INIT_DELAYED_WORK(&process->eviction_work, evict_process_worker);
 	INIT_DELAYED_WORK(&process->restore_work, restore_process_worker);
+
+	/* V17.5-rc7 F-3: per-process ordered workqueue for restore_work.
+	 * Failure is non-fatal; kfd_restore_process_queues falls back to the
+	 * legacy system-wide kfd_restore_wq when restore_wq is NULL.
+	 */
+	if (amdgpu_kfd_lock_shard_mask & KFD_SHARD_F_3_RESTORE_WQ) {
+		char wq_name[32];
+
+		snprintf(wq_name, sizeof(wq_name), "kfd_restore_%d",
+			 process->lead_thread ?
+			 (int)task_pid_nr(process->lead_thread) : 0);
+		process->restore_wq = alloc_ordered_workqueue(wq_name,
+							      WQ_FREEZABLE);
+		if (!process->restore_wq)
+			dev_warn(NULL, "kfd: F-3 per-process restore_wq alloc failed for pid=%d; falling back to global kfd_restore_wq\n",
+				 process->lead_thread ?
+				 (int)task_pid_nr(process->lead_thread) : 0);
+	}
+
 	process->last_restore_timestamp = get_jiffies_64();
 	err = kfd_event_init_process(process);
 	if (err)
@@ -1705,6 +1862,12 @@ struct kfd_process_device *kfd_create_process_device_data(struct kfd_node *dev,
 		return NULL;
 
 	pdd->dev = dev;
+	/* V17.5-rc7 F-A: per-pdd event-wait mutex. Currently a placeholder
+	 * (no site takes it yet); reserved for future per-site migration
+	 * of fast paths from kfd_process->event_mutex. See struct definition
+	 * for full rationale.
+	 */
+	mutex_init(&pdd->event_wait_mutex);
 	INIT_LIST_HEAD(&pdd->qpd.queues_list);
 	INIT_LIST_HEAD(&pdd->qpd.priv_queue_list);
 	pdd->qpd.dqm = dev->dqm;
@@ -2176,7 +2339,8 @@ void kfd_process_schedule_restore(struct kfd_process *p)
 		delay_jiffies = 0;
 
 	pr_debug("Process pid %d schedule restore work\n", p->lead_thread->pid);
-	if (mod_delayed_work(kfd_restore_wq, &p->restore_work, delay_jiffies))
+	/* V17.5-rc7 F-3: per-process wq when shard bit set, else legacy global */
+	if (mod_delayed_work(kfd_pick_restore_wq(p), &p->restore_work, delay_jiffies))
 		kfd_process_restore_queues(p);
 }
 
@@ -2277,7 +2441,8 @@ static void evict_process_worker(struct work_struct *work)
 		 * the restore work.
 		 */
 		if (signal_eviction_fence(p) ||
-		    mod_delayed_work(kfd_restore_wq, &p->restore_work,
+		    /* V17.5-rc7 F-3: per-process wq when shard bit set */
+		    mod_delayed_work(kfd_pick_restore_wq(p), &p->restore_work,
 				     msecs_to_jiffies(PROCESS_RESTORE_TIME_MS)))
 			kfd_process_restore_queues(p);
 
@@ -2348,7 +2513,8 @@ static void restore_process_worker(struct work_struct *work)
 	if (ret) {
 		pr_debug("Failed to restore BOs of process pid %d, retry after %d ms\n",
 			 p->lead_thread->pid, PROCESS_BACK_OFF_TIME_MS);
-		if (mod_delayed_work(kfd_restore_wq, &p->restore_work,
+		/* V17.5-rc7 F-3: per-process wq when shard bit set */
+		if (mod_delayed_work(kfd_pick_restore_wq(p), &p->restore_work,
 				     msecs_to_jiffies(PROCESS_RESTORE_TIME_MS)))
 			kfd_process_restore_queues(p);
 		trace_kfd_restore_process_worker_end(p, ret ?

@@ -843,6 +843,39 @@ MODULE_PARM_DESC(dmabuf_pin_max_mb,
 	"Max VRAM pinned for RDMA/PeerDirect per GPU in MB (0 = unlimited (default))");
 
 /**
+ * DOC: kfd_lock_shard_mask (uint) [V17.5-rc7 lock-shard]
+ * Bitmask kill-switch for the amdgpu/amdkfd lock-shard reorganisation. Each
+ * bit corresponds to one independent shard; bit set => sharded behaviour,
+ * bit clear => fall back to the legacy single-lock/single-wq path.
+ *
+ *   bit 0 (0x1) = F-A : per-pdd event_wait_mutex (kfd_wait_on_events shard)
+ *   bit 1 (0x2) = F-B : amdkfd_process_info.lock mutex -> rwsem conversion
+ *   bit 2 (0x4) = F-2': amdgpu_amdkfd_gpuvm chunked alloc + cond_resched
+ *   bit 3 (0x8) = F-3 : per-kfd_process restore workqueue (vs system-wide)
+ *
+ * Default 0xF (all shards enabled). Setting 0 reverts the loaded driver to
+ * pre-shard behaviour at runtime without rebuild. Read/write at 0644 so SREs
+ * can flip individual bits via /sys/module/amdgpu/parameters/kfd_lock_shard_mask.
+ */
+unsigned int amdgpu_kfd_lock_shard_mask = 0xF;
+module_param_named(kfd_lock_shard_mask, amdgpu_kfd_lock_shard_mask, uint, 0644);
+MODULE_PARM_DESC(kfd_lock_shard_mask,
+	"V17.5-rc7 amdkfd lock-shard kill-switch bitmask (bit0=F-A event_mutex, bit1=F-B process_info rwsem, bit2=F-2' alloc chunking, bit3=F-3 per-process restore_wq; default 0xF = all enabled)");
+
+/**
+ * DOC: kfd_bo_chunk_bytes (uint) [V17.5-rc7 lock-shard F-2']
+ * When F-2' is enabled (kfd_lock_shard_mask bit 2), the amdgpu_amdkfd_gpuvm
+ * alloc path splits large BOs into chunks of at most this many bytes,
+ * yielding the CPU between chunks. 0 = disable chunking even if F-2' is
+ * enabled. Default 64 MB matches the customer's median pin size (550 MB
+ * average / 8 chunks per BO).
+ */
+unsigned int amdgpu_kfd_bo_chunk_bytes = 64u << 20;
+module_param_named(kfd_bo_chunk_bytes, amdgpu_kfd_bo_chunk_bytes, uint, 0644);
+MODULE_PARM_DESC(kfd_bo_chunk_bytes,
+	"V17.5-rc7 amdkfd alloc chunk size in bytes (default 64MB = 67108864; 0 = disable chunking)");
+
+/**
  * DOC: dmabuf_reject_new_pins (int)
  * Reject new RDMA/PeerDirect pins (global kill switch).
  */
@@ -1031,6 +1064,66 @@ uint amdgpu_gtt_cgroup_reserve_mb;
 module_param_named(gtt_cgroup_reserve_mb, amdgpu_gtt_cgroup_reserve_mb, uint, 0644);
 MODULE_PARM_DESC(gtt_cgroup_reserve_mb,
 	"Reserve N MB of cgroup memcg budget when populating GTT (0=disabled, default 0)");
+
+/**
+ * DOC: evict_cross_cgroup_policy (int) [V17.5 Phase D2]
+ * Controls TTM evict victim selection across cgroups:
+ *   0 = isolate (default) -- never pick a victim from a different
+ *       cgroup than the requester. Bounds noisy-neighbour interference
+ *       to within a single cgroup.
+ *   1 = fair    -- allow cross-cgroup victims only on the escalation
+ *       pass (TTM_PL_FLAG_TEMPORARY set by caller).
+ *   2 = disable -- legacy behaviour (any victim is fair game).
+ *
+ * Telemetry: per-process counters reachable via
+ *   /sys/class/kfd/kfd/proc/<pid>/cgroup_evict_count
+ * track how often cross-cgroup victim selection was avoided.
+ */
+extern int amdgpu_evict_cross_cgroup_policy;
+module_param_named(evict_cross_cgroup_policy,
+		   amdgpu_evict_cross_cgroup_policy, int, 0644);
+MODULE_PARM_DESC(evict_cross_cgroup_policy,
+	"TTM evict victim cgroup policy: 0=isolate(default) 1=fair 2=disable");
+
+/**
+ * DOC: rdma_pin_max_per_cgroup_mb (uint) [V17.5 Phase D4]
+ * Per-cgroup KFD RDMA pin quota cap. When non-zero, a process from
+ * cgroup A is rejected with -ENOSPC if its cgroup is already pinning
+ * more than this many MB total across all KFD GPUs on this node. This
+ * is *in addition to* the legacy global dmabuf_pin_max_mb quota: a
+ * pin succeeds only when BOTH limits are within budget.
+ *
+ * Default 0 = disabled (fall back to legacy global accounting).
+ * Recommended deployment: 16384 (16 GB) per pod-class cgroup.
+ */
+uint amdgpu_rdma_pin_max_per_cgroup_mb;
+module_param_named(rdma_pin_max_per_cgroup_mb,
+		   amdgpu_rdma_pin_max_per_cgroup_mb, uint, 0644);
+MODULE_PARM_DESC(rdma_pin_max_per_cgroup_mb,
+	"Per-cgroup RDMA pin cap in MB (0=disabled, default 0)");
+
+/**
+ * DOC: kfd_migrate_deadline_ms (int) [V17.5 Phase E3]
+ * Caps the time svm_migrate_to_ram() will block waiting for either
+ * p->svms.lock or prange->migrate_mutex. When the deadline elapses
+ * the CPU page fault handler returns VM_FAULT_SIGBUS instead of
+ * blocking forever, which lets the upstream caller release
+ * mm->mmap_write_lock (typically held via __gup_longterm_locked for
+ * FOLL_LONGTERM pins) and avoids the customer GPU 0 hang signature
+ * seen at hjbog22 (vram_squat wedge in svm_migrate_to_ram while
+ * holding mmap_write_lock).
+ *
+ * Default 4000 ms = 4 s; matches kfd_wait_max_ms_per_wall=5000 minus
+ * 1 s headroom so this cap always fires *before* the KFD survival
+ * WAIT_EVENTS timer hits ret=-62.
+ * Range clamped to [100..60000] at use site.
+ * 0 = legacy infinite wait (debug only; reproduces original hang).
+ */
+int amdgpu_kfd_migrate_deadline_ms = 4000;
+module_param_named(kfd_migrate_deadline_ms,
+		   amdgpu_kfd_migrate_deadline_ms, int, 0644);
+MODULE_PARM_DESC(kfd_migrate_deadline_ms,
+	"Phase E3: cap svm_migrate_to_ram mutex waits in ms (0=infinite, default 4000)");
 
 /**
  * DOC: send_sigterm (int)

@@ -26,6 +26,8 @@
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/fdtable.h>
+#include <linux/memcontrol.h>
+#include <linux/cgroup.h>
 #include <drm/ttm/ttm_tt.h>
 
 #include <drm/drm_exec.h>
@@ -47,6 +49,276 @@
  */
 #define AMDGPU_USERPTR_RESTORE_DELAY_MS 1
 #define AMDGPU_RESERVE_MEM_LIMIT			(3UL << 29)
+
+/* -------------------------------------------------------------------------
+ * V17.5 Phase D1: per-cgroup pin accounting.
+ *
+ * Customer dmesg from 2026-04-29 showed
+ *   KFD RDMA pin rejected: pinned=17592186044412MB + new=2MB > max=4096MB
+ * which is an s64-as-u64 wrap of the global rdma_pinned_bytes counter when
+ * the legacy per-process accounting overshoots zero. The fix in
+ * amdgpu_kfd_rdma_accounting_read_clamped() prevents the wrap from
+ * propagating further, but it still allows a noisy neighbour pod to burn
+ * the entire global quota and lock the target pod out.
+ *
+ * Phase D1 adds a per-memcg bytes-pinned counter so that quota and victim
+ * selection can be made cgroup-local. This patch installs the table and
+ * the charge/drop helpers; Phase D4 wires the RDMA quota path to consult
+ * the per-cgroup limit; Phase D2/D3 use the table for victim selection.
+ * ------------------------------------------------------------------------- */
+
+#define KFD_CGROUP_PIN_BUCKETS_DEFAULT  64u
+
+struct kfd_cgroup_pin_entry {
+	u64                cgroup_id;       /* cgroup_id(memcg->css.cgroup); 0 = unused */
+	atomic64_t         bytes;           /* current bytes pinned in this cgroup */
+	atomic64_t         peak_bytes;      /* high-water mark */
+	atomic64_t         reject_count;    /* per-cgroup rejections (Phase D4) */
+	atomic64_t         evict_avoided;   /* Phase D2/D3 */
+	struct hlist_node  node;            /* unused while we use linear-probe */
+};
+
+static struct kfd_cgroup_pin_entry *
+amdgpu_kfd_cgroup_pin_table_alloc(unsigned int nr_buckets)
+{
+	struct kfd_cgroup_pin_entry *t;
+
+	if (!nr_buckets)
+		nr_buckets = KFD_CGROUP_PIN_BUCKETS_DEFAULT;
+
+	t = kcalloc(nr_buckets, sizeof(*t), GFP_KERNEL);
+	if (!t)
+		return NULL;
+	return t;
+}
+
+int amdgpu_kfd_cgroup_pin_table_init(struct amdgpu_device *adev)
+{
+	struct amdgpu_kfd_cgroup_pin_table *tab = &adev->kfd.cgroup_pin_table;
+
+	rwlock_init(&tab->lock);
+	atomic_set(&tab->live_entries, 0);
+	tab->nr_buckets = KFD_CGROUP_PIN_BUCKETS_DEFAULT;
+	tab->entries = amdgpu_kfd_cgroup_pin_table_alloc(tab->nr_buckets);
+	if (!tab->entries)
+		return -ENOMEM;
+	return 0;
+}
+
+void amdgpu_kfd_cgroup_pin_table_fini(struct amdgpu_device *adev)
+{
+	struct amdgpu_kfd_cgroup_pin_table *tab = &adev->kfd.cgroup_pin_table;
+
+	write_lock(&tab->lock);
+	kfree(tab->entries);
+	tab->entries = NULL;
+	tab->nr_buckets = 0;
+	atomic_set(&tab->live_entries, 0);
+	write_unlock(&tab->lock);
+}
+
+/*
+ * Linear-probe open hash. Concurrent readers OK under rwlock. Writers
+ * (alloc-on-miss) take write_lock. The table is small (64 buckets) and
+ * is sized to fit the number of distinct cgroups that own a GPU; even
+ * the heavy k8s pin storm in the customer trace only touched ~6 pods
+ * per node, so collisions are rare. If we overflow we return NULL and
+ * fall back to the global counter.
+ */
+static struct kfd_cgroup_pin_entry *
+kfd_cgroup_pin_lookup(struct amdgpu_kfd_cgroup_pin_table *tab, u64 cg_id)
+{
+	unsigned int i, start;
+
+	if (!tab->entries || !tab->nr_buckets || !cg_id)
+		return NULL;
+
+	start = (unsigned int)(cg_id % tab->nr_buckets);
+	for (i = 0; i < tab->nr_buckets; ++i) {
+		struct kfd_cgroup_pin_entry *e =
+			&tab->entries[(start + i) % tab->nr_buckets];
+		u64 id = READ_ONCE(e->cgroup_id);
+
+		if (id == cg_id)
+			return e;
+		if (!id)
+			return NULL;
+	}
+	return NULL;
+}
+
+static struct kfd_cgroup_pin_entry *
+kfd_cgroup_pin_get_or_alloc(struct amdgpu_kfd_cgroup_pin_table *tab, u64 cg_id)
+{
+	struct kfd_cgroup_pin_entry *e;
+	unsigned int i, start;
+
+	if (!cg_id)
+		return NULL;
+
+	read_lock(&tab->lock);
+	e = kfd_cgroup_pin_lookup(tab, cg_id);
+	read_unlock(&tab->lock);
+	if (e)
+		return e;
+
+	write_lock(&tab->lock);
+	e = kfd_cgroup_pin_lookup(tab, cg_id);
+	if (e)
+		goto unlock;
+
+	if (!tab->entries || !tab->nr_buckets)
+		goto unlock;
+
+	start = (unsigned int)(cg_id % tab->nr_buckets);
+	for (i = 0; i < tab->nr_buckets; ++i) {
+		struct kfd_cgroup_pin_entry *cand =
+			&tab->entries[(start + i) % tab->nr_buckets];
+		if (!cand->cgroup_id) {
+			atomic64_set(&cand->bytes, 0);
+			atomic64_set(&cand->peak_bytes, 0);
+			atomic64_set(&cand->reject_count, 0);
+			atomic64_set(&cand->evict_avoided, 0);
+			WRITE_ONCE(cand->cgroup_id, cg_id);
+			atomic_inc(&tab->live_entries);
+			e = cand;
+			break;
+		}
+	}
+unlock:
+	write_unlock(&tab->lock);
+	return e;
+}
+
+/*
+ * Charge `bytes` to the cgroup that owns `p`. Returns the entry on success
+ * (caller may inspect entry's atomic counters); NULL if the process has no
+ * memcg (root) or the table is full / disabled.
+ *
+ * Counters are clamped: bytes is interpreted unsigned, peak_bytes is
+ * updated only on increase, never on decrement. There is no negative
+ * value reachable from charge/drop, which is the structural fix for the
+ * "pinned=17592186044412MB" wrap observed in production rc4.
+ */
+struct kfd_cgroup_pin_entry *
+amdgpu_kfd_cgroup_pin_charge(struct amdgpu_device *adev,
+			     struct kfd_process *p, u64 bytes)
+{
+	struct kfd_cgroup_pin_entry *e;
+	u64 newv, peak;
+
+	if (!p || !bytes)
+		return NULL;
+	if (!p->kfd_memcg_id)
+		return NULL;
+
+	e = kfd_cgroup_pin_get_or_alloc(&adev->kfd.cgroup_pin_table,
+					p->kfd_memcg_id);
+	if (!e)
+		return NULL;
+
+	newv = (u64)atomic64_add_return((s64)bytes, &e->bytes);
+	atomic64_add((s64)bytes, &p->kfd_memcg_pinned_bytes);
+
+	/* lockless peak update */
+	for (;;) {
+		peak = (u64)atomic64_read(&e->peak_bytes);
+		if (newv <= peak)
+			break;
+		if (atomic64_cmpxchg(&e->peak_bytes, (s64)peak, (s64)newv) == (s64)peak)
+			break;
+	}
+	return e;
+}
+
+void amdgpu_kfd_cgroup_pin_drop(struct amdgpu_device *adev,
+				struct kfd_process *p, u64 bytes)
+{
+	struct kfd_cgroup_pin_entry *e;
+	s64 cur, want;
+
+	if (!p || !bytes)
+		return;
+	if (!p->kfd_memcg_id)
+		return;
+
+	e = kfd_cgroup_pin_get_or_alloc(&adev->kfd.cgroup_pin_table,
+					p->kfd_memcg_id);
+	if (!e)
+		return;
+
+	for (;;) {
+		cur = atomic64_read(&e->bytes);
+		want = cur - (s64)bytes;
+		if (want < 0)
+			want = 0;  /* clamp underflow */
+		if (atomic64_cmpxchg(&e->bytes, cur, want) == cur)
+			break;
+	}
+
+	for (;;) {
+		cur = atomic64_read(&p->kfd_memcg_pinned_bytes);
+		want = cur - (s64)bytes;
+		if (want < 0)
+			want = 0;
+		if (atomic64_cmpxchg(&p->kfd_memcg_pinned_bytes, cur, want) == cur)
+			break;
+	}
+}
+
+u64 amdgpu_kfd_cgroup_pin_bytes(struct amdgpu_device *adev, u64 cg_id)
+{
+	struct kfd_cgroup_pin_entry *e;
+	u64 v = 0;
+
+	read_lock(&adev->kfd.cgroup_pin_table.lock);
+	e = kfd_cgroup_pin_lookup(&adev->kfd.cgroup_pin_table, cg_id);
+	if (e)
+		v = (u64)atomic64_read(&e->bytes);
+	read_unlock(&adev->kfd.cgroup_pin_table.lock);
+	return v;
+}
+/*
+ * V17.5 Phase D4.1 hotfix: drop variant that takes cg id directly.
+ *
+ * Caller stashed kgd_mem->kfd_cg_id_charged at charge time and uses
+ * it here so the drop succeeds even if the owning task has already
+ * exited (the common case for peerdirect free_callback racing with
+ * pinner process teardown).
+ *
+ * This intentionally updates ONLY the per-cgroup counter (the one
+ * used by amdgpu_kfd_rdma_quota_cgroup_ok for enforcement). The
+ * per-process kfd_memcg_pinned_bytes counter is best-effort and is
+ * skipped when the owner can no longer be resolved, which is a
+ * /proc-visibility cosmetic loss rather than a functional bug.
+ */
+void amdgpu_kfd_cgroup_pin_drop_by_id(struct amdgpu_device *adev,
+				      u64 cg_id, u64 bytes)
+{
+	struct kfd_cgroup_pin_entry *e;
+	s64 cur, want;
+
+	if (!cg_id || !bytes)
+		return;
+
+	e = kfd_cgroup_pin_get_or_alloc(&adev->kfd.cgroup_pin_table, cg_id);
+	if (!e)
+		return;
+
+	for (;;) {
+		cur = atomic64_read(&e->bytes);
+		want = cur - (s64)bytes;
+		if (want < 0)
+			want = 0;
+		if (atomic64_cmpxchg(&e->bytes, cur, want) == cur)
+			break;
+	}
+}
+
+EXPORT_SYMBOL_GPL(amdgpu_kfd_cgroup_pin_charge);
+EXPORT_SYMBOL_GPL(amdgpu_kfd_cgroup_pin_drop);
+EXPORT_SYMBOL_GPL(amdgpu_kfd_cgroup_pin_drop_by_id);
+EXPORT_SYMBOL_GPL(amdgpu_kfd_cgroup_pin_bytes);
 
 /*
  * Align VRAM availability to 2MB to avoid fragmentation caused by 4K allocations in the tail 2MB
@@ -1082,21 +1354,21 @@ static void add_kgd_mem_to_kfd_bo_list(struct kgd_mem *mem,
 				struct amdkfd_process_info *process_info,
 				bool userptr)
 {
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 	if (userptr)
 		list_add_tail(&mem->validate_list,
 			      &process_info->userptr_valid_list);
 	else
 		list_add_tail(&mem->validate_list, &process_info->kfd_bo_list);
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 }
 
 static void remove_kgd_mem_from_kfd_bo_list(struct kgd_mem *mem,
 		struct amdkfd_process_info *process_info)
 {
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 	list_del(&mem->validate_list);
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 }
 
 /* Initializes user pages. It registers the MMU notifier and validates
@@ -1120,7 +1392,7 @@ static int init_user_pages(struct kgd_mem *mem, uint64_t user_addr,
 	struct hmm_range *range;
 	int ret = 0;
 
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 
 	ret = amdgpu_ttm_tt_set_userptr(&bo->tbo, user_addr, 0);
 	if (ret) {
@@ -1145,7 +1417,7 @@ static int init_user_pages(struct kgd_mem *mem, uint64_t user_addr,
 		mutex_lock(&process_info->notifier_lock);
 		mem->invalid++;
 		mutex_unlock(&process_info->notifier_lock);
-		mutex_unlock(&process_info->lock);
+		up_write(&process_info->lock);
 		return 0;
 	}
 
@@ -1207,7 +1479,7 @@ unregister_out:
 	if (ret)
 		amdgpu_hmm_unregister(bo);
 out:
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 	return ret;
 }
 
@@ -1482,7 +1754,11 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
 		if (!info)
 			return -ENOMEM;
 
-		mutex_init(&info->lock);
+		/* V17.5-rc7 F-B: rwsem replaces mutex; all sites currently use
+		 * down_write so behaviour is mutex-equivalent. Reserved for
+		 * future per-site RO downgrades.
+		 */
+		init_rwsem(&info->lock);
 		mutex_init(&info->notifier_lock);
 		INIT_LIST_HEAD(&info->vm_list_head);
 		INIT_LIST_HEAD(&info->kfd_bo_list);
@@ -1530,13 +1806,13 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
 	amdgpu_bo_unreserve(vm->root.bo);
 
 	/* Update process info */
-	mutex_lock(&vm->process_info->lock);
+	down_write(&vm->process_info->lock);
 	list_add_tail(&vm->vm_list_node,
 			&(vm->process_info->vm_list_head));
 	vm->process_info->n_vms++;
 	if (ef)
 		*ef = dma_fence_get(&vm->process_info->eviction_fence->base);
-	mutex_unlock(&vm->process_info->lock);
+	up_write(&vm->process_info->lock);
 
 	return 0;
 
@@ -1551,7 +1827,7 @@ reserve_pd_fail:
 		*process_info = NULL;
 		put_pid(info->pid);
 create_evict_fence_fail:
-		mutex_destroy(&info->lock);
+		/* V17.5-rc7 F-B: info->lock is now rw_semaphore (no destroy) */
 		mutex_destroy(&info->notifier_lock);
 		kfree(info);
 	}
@@ -1576,6 +1852,47 @@ static s64 amdgpu_kfd_rdma_accounting_read_clamped(struct amdgpu_device *adev,
 	}
 
 	return 0;
+}
+
+extern uint amdgpu_rdma_pin_max_per_cgroup_mb;  /* V17.5 Phase D4 */
+
+/*
+ * V17.5 Phase D4: per-cgroup RDMA pin quota check.
+ *
+ * Returns true if the requested bytes fit within the per-cgroup cap
+ * (or if the cap is 0, or if the calling process has no memcg). Does
+ * NOT mutate any counter -- the actual charge to the per-cgroup
+ * counter happens in amdgpu_kfd_cgroup_pin_charge() in the pin success
+ * path; this is a pre-check so we can reject early with -ENOSPC and
+ * keep the global counter clean.
+ */
+static bool amdgpu_kfd_rdma_quota_cgroup_ok(struct amdgpu_device *adev,
+					    struct kfd_process *p,
+					    u64 bo_size)
+{
+	u64 cap = (u64)amdgpu_rdma_pin_max_per_cgroup_mb << 20;
+	u64 cur;
+
+	if (!cap)
+		return true;            /* Phase D4 disabled */
+	if (!p || !p->kfd_memcg_id)
+		return true;            /* no cgroup -> fall back to global */
+
+	cur = amdgpu_kfd_cgroup_pin_bytes(adev, p->kfd_memcg_id);
+	if (cur > cap || bo_size > cap - cur) {
+		struct kfd_cgroup_pin_entry *e =
+			kfd_cgroup_pin_get_or_alloc(&adev->kfd.cgroup_pin_table,
+						    p->kfd_memcg_id);
+		if (e)
+			atomic64_inc(&e->reject_count);
+		dev_info_ratelimited(adev->dev,
+			"KFD RDMA pin rejected per-cgroup: cg=%llu pinned=%lluMB + new=%lluMB > cap=%uMB\n",
+			(unsigned long long)p->kfd_memcg_id,
+			cur >> 20, bo_size >> 20,
+			amdgpu_rdma_pin_max_per_cgroup_mb);
+		return false;
+	}
+	return true;
 }
 
 static bool amdgpu_kfd_rdma_quota_try_charge(struct amdgpu_device *adev,
@@ -1689,10 +2006,33 @@ int amdgpu_amdkfd_gpuvm_pin_bo(struct amdgpu_bo *bo, u32 domain)
 	 * Charge only once per KFD BO. PeerDirect can issue many get_pages()
 	 * calls for small subranges of the same BO; those are extra pin refs,
 	 * not extra physical pinned VRAM.
+	 *
+	 * V17.5 Phase D4: also enforce the per-cgroup cap before the global
+	 * check, so a noisy pod cannot saturate the global quota at the
+	 * expense of the target pod.
 	 */
 	if (dmabuf_pin_max_mb && kgd_mem && (domain & AMDGPU_GEM_DOMAIN_VRAM) &&
 	    !kgd_mem->rdma_quota_charged) {
 		u64 new_total = 0;
+		struct kfd_process *owner = NULL;
+
+		/* Resolve the BO owner once for the cgroup pre-check. */
+		if (kgd_mem->process_info && kgd_mem->process_info->pid) {
+			struct task_struct *otask;
+			rcu_read_lock();
+			otask = pid_task(kgd_mem->process_info->pid, PIDTYPE_PID);
+			if (otask)
+				owner = kfd_lookup_process_by_mm(otask->mm);
+			rcu_read_unlock();
+		}
+		if (owner &&
+		    !amdgpu_kfd_rdma_quota_cgroup_ok(adev, owner, bo_size)) {
+			kfd_unref_process(owner);
+			ret = -ENOSPC;
+			goto out;
+		}
+		if (owner)
+			kfd_unref_process(owner);
 
 		if (!amdgpu_kfd_rdma_quota_try_charge(adev, bo_size, &new_total)) {
 			ret = -ENOSPC;
@@ -1734,6 +2074,17 @@ int amdgpu_amdkfd_gpuvm_pin_bo(struct amdgpu_bo *bo, u32 domain)
 		goto out;
 	}
 
+	/* V17.5-rc7 F-2': amdgpu_bo_pin() above can take milliseconds for
+	 * a multi-hundred-MB BO (TTM validate + placement + DMA mapping
+	 * sgtable build).  Yield once after a successful pin so other
+	 * threads (including the WAIT_EVENTS path on neighbour GPUs) can
+	 * make progress before we continue into amdgpu_bo_sync_wait().
+	 */
+	if ((amdgpu_kfd_lock_shard_mask & KFD_SHARD_F_2P_ALLOC_CHUNK) &&
+	    (amdgpu_kfd_bo_chunk_bytes == 0 ||
+	     bo_size >= amdgpu_kfd_bo_chunk_bytes))
+		cond_resched();
+
 	amdgpu_bo_sync_wait(bo, AMDGPU_FENCE_OWNER_KFD, false);
 
 	if (!ret)
@@ -1744,6 +2095,41 @@ int amdgpu_amdkfd_gpuvm_pin_bo(struct amdgpu_bo *bo, u32 domain)
 
 	if (!ret && bo->tbo.resource->mem_type == TTM_PL_VRAM)
 		atomic64_add(amdgpu_bo_size(bo), &adev->kfd.vram_pinned);
+
+	/*
+	 * V17.5 Phase D1: charge per-cgroup counter on a successful pin.
+	 * We charge for every successful pin (VRAM or GTT) so the table
+	 * accurately reflects pinned host AND device bytes per cgroup.
+	 * kgd_mem may be NULL (kernel-side internal BOs) -- skip those,
+	 * the cgroup attribution is meaningless without a user owner.
+	 */
+	if (!ret && kgd_mem && kgd_mem->process_info) {
+		struct kfd_process *owner = NULL;
+		struct pid *opid = kgd_mem->process_info->pid;
+		struct task_struct *otask;
+
+		if (opid) {
+			rcu_read_lock();
+			otask = pid_task(opid, PIDTYPE_PID);
+			if (otask)
+				owner = kfd_lookup_process_by_mm(otask->mm);
+			rcu_read_unlock();
+		}
+		if (owner) {
+			amdgpu_kfd_cgroup_pin_charge(adev, owner, bo_size);
+			/*
+			 * V17.5 Phase D4.1 hotfix: stash cg id so the drop
+			 * path can succeed even after this task exits.
+			 * Refresh on every successful charge so a process
+			 * that migrated cgroups still drops against the
+			 * latest one.
+			 */
+			if (owner->kfd_memcg_id)
+				kgd_mem->kfd_cg_id_charged =
+					owner->kfd_memcg_id;
+			kfd_unref_process(owner);
+		}
+	}
 
 	if (!ret && kgd_mem && dmabuf_pin_max_mb &&
 	    (domain & AMDGPU_GEM_DOMAIN_VRAM) &&
@@ -1872,6 +2258,40 @@ void amdgpu_amdkfd_gpuvm_unpin_bo(struct amdgpu_bo *bo)
 				(u64)amdgpu_kfd_rdma_accounting_read_clamped(adev, "watermark_after_unpin"));
 	}
 
+	/*
+	 * V17.5 Phase D1 + D4.1: drop the per-cgroup counter. Mirrors the
+	 * charge site in amdgpu_amdkfd_gpuvm_pin_bo. We must drop bytes
+	 * for ANY memory type (VRAM or GTT) since pin charged for any pin.
+	 *
+	 * D4.1 hotfix: prefer the cg id we cached on kgd_mem at charge
+	 * time. The owning task may have already exited by the time the
+	 * peerdirect free_callback drives this unpin (the common case);
+	 * pid_task() then returns NULL and the mm-lookup path silently
+	 * skips the drop, stranding bytes on the per-cgroup counter and
+	 * poisoning the next pod scheduled to the same cgroup id.
+	 */
+	if (kgd_mem && kgd_mem->kfd_cg_id_charged) {
+		amdgpu_kfd_cgroup_pin_drop_by_id(adev,
+			kgd_mem->kfd_cg_id_charged, amdgpu_bo_size(bo));
+	} else if (kgd_mem && kgd_mem->process_info) {
+		struct kfd_process *owner = NULL;
+		struct pid *opid = kgd_mem->process_info->pid;
+		struct task_struct *otask;
+
+		if (opid) {
+			rcu_read_lock();
+			otask = pid_task(opid, PIDTYPE_PID);
+			if (otask)
+				owner = kfd_lookup_process_by_mm(otask->mm);
+			rcu_read_unlock();
+		}
+		if (owner) {
+			amdgpu_kfd_cgroup_pin_drop(adev, owner,
+						   amdgpu_bo_size(bo));
+			kfd_unref_process(owner);
+		}
+	}
+
 	amdgpu_bo_unreserve(bo);
 }
 
@@ -1910,10 +2330,10 @@ void amdgpu_amdkfd_gpuvm_destroy_cb(struct amdgpu_device *adev,
 		return;
 
 	/* Update process info */
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 	process_info->n_vms--;
 	list_del(&vm->vm_list_node);
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 
 	vm->process_info = NULL;
 
@@ -1926,7 +2346,7 @@ void amdgpu_amdkfd_gpuvm_destroy_cb(struct amdgpu_device *adev,
 		dma_fence_put(&process_info->eviction_fence->base);
 		cancel_delayed_work_sync(&process_info->restore_userptr_work);
 		put_pid(process_info->pid);
-		mutex_destroy(&process_info->lock);
+		/* V17.5-rc7 F-B: rwsem has no explicit destroy operation */
 		mutex_destroy(&process_info->notifier_lock);
 		kfree(process_info);
 	}
@@ -1947,9 +2367,9 @@ void amdgpu_amdkfd_block_mmu_notifications(void *p)
 {
 	struct amdkfd_process_info *pinfo = (struct amdkfd_process_info *)p;
 
-	mutex_lock(&pinfo->lock);
+	down_write(&pinfo->lock);
 	WRITE_ONCE(pinfo->block_mmu_notifications, true);
-	mutex_unlock(&pinfo->lock);
+	up_write(&pinfo->lock);
 }
 
 int amdgpu_amdkfd_criu_resume(void *p)
@@ -1957,7 +2377,7 @@ int amdgpu_amdkfd_criu_resume(void *p)
 	int ret = 0;
 	struct amdkfd_process_info *pinfo = (struct amdkfd_process_info *)p;
 
-	mutex_lock(&pinfo->lock);
+	down_write(&pinfo->lock);
 	pr_debug("scheduling work\n");
 	mutex_lock(&pinfo->notifier_lock);
 	pinfo->evicted_bos++;
@@ -1971,7 +2391,7 @@ int amdgpu_amdkfd_criu_resume(void *p)
 			   &pinfo->restore_userptr_work, 0);
 
 out_unlock:
-	mutex_unlock(&pinfo->lock);
+	up_write(&pinfo->lock);
 	return ret;
 }
 
@@ -2136,6 +2556,20 @@ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
 			 domain_string(alloc_domain), ret);
 		goto err_bo_create;
 	}
+
+	/* V17.5-rc7 F-2': cooperative yield after the large buddy-allocator
+	 * walk inside amdgpu_gem_object_create -> ttm_bo_init_validate ->
+	 * ttm_pool_alloc.  For a 286 MB GTT BO (customer's mean pin size)
+	 * the buddy walk touches ~73 168 pages and runs for tens of ms;
+	 * without cond_resched() this can serialise concurrent KFD ioctls
+	 * from other processes that are waiting for CPU.  Gated by
+	 * KFD_SHARD_F_2P_ALLOC_CHUNK; threshold from kfd_bo_chunk_bytes
+	 * (0 = always yield once we got here, default 64 MB).
+	 */
+	if ((amdgpu_kfd_lock_shard_mask & KFD_SHARD_F_2P_ALLOC_CHUNK) &&
+	    (amdgpu_kfd_bo_chunk_bytes == 0 ||
+	     aligned_size >= amdgpu_kfd_bo_chunk_bytes))
+		cond_resched();
 	ret = drm_vma_node_allow(&gobj->vma_node, drm_priv);
 	if (ret) {
 		pr_debug("Failed to allow vma node access. ret %d\n", ret);
@@ -2176,12 +2610,12 @@ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
 		bo->allowed_domains = AMDGPU_GEM_DOMAIN_GTT;
 		bo->preferred_domains = AMDGPU_GEM_DOMAIN_GTT;
 	} else {
-		mutex_lock(&avm->process_info->lock);
+		down_write(&avm->process_info->lock);
 		if (avm->process_info->eviction_fence &&
 		    !dma_fence_is_signaled(&avm->process_info->eviction_fence->base))
 			ret = amdgpu_amdkfd_bo_validate_and_fence(bo, domain,
 				&avm->process_info->eviction_fence->base);
-		mutex_unlock(&avm->process_info->lock);
+		up_write(&avm->process_info->lock);
 		if (ret)
 			goto err_validate_bo;
 	}
@@ -2254,9 +2688,9 @@ int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
 	}
 
 	/* Make sure restore workers don't access the BO any more */
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 	list_del(&mem->validate_list);
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 
 	/* Cleanup user pages and MMU notifiers */
 	if (amdgpu_ttm_tt_get_usermm(mem->bo->tbo.ttm)) {
@@ -2416,7 +2850,7 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
 	 * don't map invalid userptr BOs, we rely on the next restore
 	 * worker to do the mapping
 	 */
-	mutex_lock(&mem->process_info->lock);
+	down_write(&mem->process_info->lock);
 
 	/* Lock notifier lock. If we find an invalid userptr BO, we can be
 	 * sure that the MMU notifier is no longer running
@@ -2494,7 +2928,7 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
 out_unreserve:
 	unreserve_bo_and_vms(&ctx, false, false);
 out:
-	mutex_unlock(&mem->process_info->lock);
+	up_write(&mem->process_info->lock);
 	mutex_unlock(&mem->lock);
 	return ret;
 }
@@ -2673,7 +3107,7 @@ int amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel(struct kgd_mem *mem,
 		return -EINVAL;
 	}
 
-	mutex_lock(&mem->process_info->lock);
+	down_write(&mem->process_info->lock);
 
 	ret = amdgpu_bo_reserve(bo, true);
 	if (ret) {
@@ -2701,7 +3135,7 @@ int amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel(struct kgd_mem *mem,
 
 	amdgpu_bo_unreserve(bo);
 
-	mutex_unlock(&mem->process_info->lock);
+	up_write(&mem->process_info->lock);
 	return 0;
 
 kmap_failed:
@@ -2709,7 +3143,7 @@ kmap_failed:
 pin_failed:
 	amdgpu_bo_unreserve(bo);
 bo_reserve_failed:
-	mutex_unlock(&mem->process_info->lock);
+	up_write(&mem->process_info->lock);
 
 	return ret;
 }
@@ -2985,12 +3419,12 @@ static int import_obj_create(struct amdgpu_device *adev,
 	amdgpu_sync_create(&(*mem)->sync);
 	(*mem)->is_imported = true;
 
-	mutex_lock(&avm->process_info->lock);
+	down_write(&avm->process_info->lock);
 	if (avm->process_info->eviction_fence &&
 	    !dma_fence_is_signaled(&avm->process_info->eviction_fence->base))
 		ret = amdgpu_amdkfd_bo_validate_and_fence(bo, (*mem)->domain,
 				&avm->process_info->eviction_fence->base);
-	mutex_unlock(&avm->process_info->lock);
+	up_write(&avm->process_info->lock);
 	if (ret)
 		goto err_remove_mem;
 
@@ -3524,7 +3958,7 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
 		return;
 	}
 
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 
 	if (update_invalid_user_pages(process_info, mm))
 		goto unlock_out;
@@ -3562,7 +3996,7 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
 unlock_notifier_out:
 	mutex_unlock(&process_info->notifier_lock);
 unlock_out:
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 
 	/* If validation failed, reschedule another attempt */
 	if (evicted_bos) {
@@ -3625,7 +4059,7 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info, struct dma_fence __rcu *
 
 	INIT_LIST_HEAD(&duplicate_save);
 
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 
 	drm_exec_init(&exec, DRM_EXEC_IGNORE_DUPLICATES, 0);
 	drm_exec_until_all_locked(&exec) {
@@ -3805,7 +4239,7 @@ validate_map_fail:
 	amdgpu_sync_free(&sync_obj);
 ttm_reserve_fail:
 	drm_exec_fini(&exec);
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 	return ret;
 }
 
@@ -3832,7 +4266,7 @@ int amdgpu_amdkfd_add_gws_to_process(void *info, void *gws, struct kgd_mem **mem
 
 
 	/* Validate gws bo the first time it is added to process */
-	mutex_lock(&(*mem)->process_info->lock);
+	down_write(&(*mem)->process_info->lock);
 	ret = amdgpu_bo_reserve(gws_bo, false);
 	if (unlikely(ret)) {
 		pr_err("Reserve gws bo failed %d\n", ret);
@@ -3855,7 +4289,7 @@ int amdgpu_amdkfd_add_gws_to_process(void *info, void *gws, struct kgd_mem **mem
 			   &process_info->eviction_fence->base,
 			   DMA_RESV_USAGE_BOOKKEEP);
 	amdgpu_bo_unreserve(gws_bo);
-	mutex_unlock(&(*mem)->process_info->lock);
+	up_write(&(*mem)->process_info->lock);
 
 	return ret;
 
@@ -3863,7 +4297,7 @@ reserve_shared_fail:
 bo_validation_failure:
 	amdgpu_bo_unreserve(gws_bo);
 bo_reservation_failure:
-	mutex_unlock(&(*mem)->process_info->lock);
+	up_write(&(*mem)->process_info->lock);
 	amdgpu_sync_free(&(*mem)->sync);
 	remove_kgd_mem_from_kfd_bo_list(*mem, process_info);
 	amdgpu_bo_unref(&gws_bo);

@@ -342,6 +342,30 @@ static void amdgpu_kfd_reaper_fn(struct work_struct *work)
 				bo->kfd_bo->rdma_quota_charged = false;
 			}
 
+			/*
+			 * V17.5 Phase D4.1.1 hotfix: also steal & drop the
+			 * per-cgroup counter for the same bytes.
+			 *
+			 * Without this, the reaper drops only the global
+			 * counter; the cgroup counter stays charged, and
+			 * the cascading amd_put_pages -> unpin_bo early-
+			 * returns at pin_count==0 so it never gets to the
+			 * D4.1 cgroup-drop block either. Net effect:
+			 * per-cgroup counter leaks the orphan's bytes
+			 * forever and the next pod scheduled to the same
+			 * cgroup is wrongly rejected.
+			 *
+			 * Clear kfd_cg_id_charged after the drop so the
+			 * cascading unpin_bo's D4.1 block is a no-op for
+			 * this BO (prevents double-drop).
+			 */
+			if (bo->kfd_bo && bo->kfd_bo->kfd_cg_id_charged) {
+				amdgpu_kfd_cgroup_pin_drop_by_id(adev,
+					bo->kfd_bo->kfd_cg_id_charged,
+					amdgpu_bo_size(bo));
+				bo->kfd_bo->kfd_cg_id_charged = 0;
+			}
+
 			while (bo->tbo.pin_count > 0)
 				amdgpu_bo_unpin(bo);
 

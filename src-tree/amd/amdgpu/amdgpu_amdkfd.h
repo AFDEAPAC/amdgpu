@@ -103,6 +103,23 @@ struct kgd_mem {
 	u32 rdma_quota_pin_count;
 	u64 rdma_quota_bytes;
 	bool rdma_quota_charged;
+
+	/*
+	 * V17.5 Phase D4.1 hotfix: cgroup id at charge time so the drop
+	 * path does not require the owning task to still be alive.
+	 *
+	 * The peerdirect free_callback -> amd_put_pages -> unpin_bo
+	 * chain can run AFTER the owning task has exited; pid_task()
+	 * then returns NULL, the mm-lookup path fails, and
+	 * amdgpu_kfd_cgroup_pin_drop is skipped. Cgroup outlives task,
+	 * so the next pod scheduled to the same cgroup id inherits the
+	 * leaked debt and is wrongly rejected by
+	 * amdgpu_kfd_rdma_quota_cgroup_ok.
+	 *
+	 * Zero = no cached id; fall back to mm-lookup.
+	 * Non-zero = drop against this cg id unconditionally.
+	 */
+	u64 kfd_cg_id_charged;
 };
 
 /* KFD Memory Eviction */
@@ -156,7 +173,45 @@ struct amdgpu_kfd_dev {
 
 	/* Client for KFD BO GEM handle allocations */
 	struct drm_client_dev client;
+
+	/*
+	 * V17.5 Phase D1: per-memcg pin accounting.
+	 *
+	 * cgroup_pin_table[] is a small open-hash of struct kfd_cgroup_pin_entry
+	 * indexed by ino_t (mem_cgroup css inode number). Each entry tracks
+	 * the bytes that were pinned by processes inside that cgroup, plus
+	 * a per-cgroup peak and a per-cgroup reject counter. All counters
+	 * are clamped at zero on underflow (the customer-observed u64 wrap
+	 * pinned=17592186044412MB only happens if a counter is allowed to
+	 * underflow into the negative s64 range; this table charges and
+	 * drops via clamped helpers).
+	 *
+	 * Read lock: cgroup_pin_rwlock (rwspinlock). Write lock for table
+	 * mutation; charge/drop are atomic on the entry's atomic64_t fields
+	 * after entry lookup under read lock.
+	 */
+	struct amdgpu_kfd_cgroup_pin_table {
+		struct kfd_cgroup_pin_entry *entries;  /* nr_buckets */
+		unsigned int nr_buckets;
+		rwlock_t lock;
+		atomic_t live_entries;
+	} cgroup_pin_table;
 };
+
+/* V17.5 Phase D1: opaque to consumers. Definition in amdgpu_amdkfd_gpuvm.c. */
+struct kfd_cgroup_pin_entry;
+struct kfd_process;  /* forward decl so the prototypes below see file-scope type */
+
+int  amdgpu_kfd_cgroup_pin_table_init(struct amdgpu_device *adev);
+void amdgpu_kfd_cgroup_pin_table_fini(struct amdgpu_device *adev);
+struct kfd_cgroup_pin_entry *
+amdgpu_kfd_cgroup_pin_charge(struct amdgpu_device *adev,
+			     struct kfd_process *p, u64 bytes);
+void amdgpu_kfd_cgroup_pin_drop_by_id(struct amdgpu_device *adev,
+				      u64 cg_id, u64 bytes);
+void amdgpu_kfd_cgroup_pin_drop(struct amdgpu_device *adev,
+				struct kfd_process *p, u64 bytes);
+u64  amdgpu_kfd_cgroup_pin_bytes(struct amdgpu_device *adev, u64 cg_id);
 
 /*
  * V15.5: a BO whose owning process dropped the mem without hipFree completing
@@ -193,8 +248,20 @@ struct amdkfd_process_info {
 	/* List of userptr BOs that are valid or invalid */
 	struct list_head userptr_valid_list;
 	struct list_head userptr_inval_list;
-	/* Lock to protect kfd_bo_list */
-	struct mutex lock;
+	/* Lock to protect vm_list_head / kfd_bo_list / userptr_*_list +
+	 * the eviction_fence pointer. In V17.5-rc7 this was converted from
+	 * struct mutex to struct rw_semaphore (F-B scaffolding) so future
+	 * per-site audits can downgrade pure list-walk callers to
+	 * down_read while mutators stay on down_write. Initial conversion
+	 * is mechanical: every existing mutex_lock/unlock pair becomes
+	 * down_write/up_write so the behaviour is identical to a mutex
+	 * (single-writer, no reader concurrency yet).
+	 *
+	 * The F-B kill-switch bit (KFD_SHARD_F_B_PROCESS_INFO) is reserved
+	 * for future RO-downgrade gating; in this initial scaffold it is
+	 * a no-op.
+	 */
+	struct rw_semaphore lock;
 
 	/* Number of VMs */
 	unsigned int n_vms;

@@ -393,7 +393,7 @@ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
 	if (!obj->import_attach ||
 	    !dma_buf_is_dynamic(obj->import_attach->dmabuf))
 		return 0;
-	mutex_lock_nested(&vm->process_info->lock, 1);
+	down_write_nested(&vm->process_info->lock, 1); /* V17.5-rc7 F-B: rwsem */
 	if (!WARN_ON(!vm->process_info->eviction_fence)) {
 		r = amdgpu_amdkfd_bo_validate_and_fence(abo, AMDGPU_GEM_DOMAIN_GTT,
 							&vm->process_info->eviction_fence->base);
@@ -407,7 +407,7 @@ static int amdgpu_gem_object_open(struct drm_gem_object *obj,
 			}
 		}
 	}
-	mutex_unlock(&vm->process_info->lock);
+	up_write(&vm->process_info->lock); /* V17.5-rc7 F-B: rwsem */
 
 	return r;
 }

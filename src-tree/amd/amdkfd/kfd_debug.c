@@ -42,7 +42,7 @@ int kfd_dbg_ev_query_debug_event(struct kfd_process *process,
 	if (!(process && process->debug_trap_enabled))
 		return -ENODATA;
 
-	mutex_lock(&process->event_mutex);
+	down_write(&process->event_mutex) /* V17.5-rc7 F-A+ */;
 	*event_status = 0;
 	*queue_id = 0;
 	*gpu_id = 0;
@@ -89,7 +89,7 @@ int kfd_dbg_ev_query_debug_event(struct kfd_process *process,
 	}
 
 out:
-	mutex_unlock(&process->event_mutex);
+	up_write(&process->event_mutex) /* V17.5-rc7 F-A+ */;
 	return *event_status ? 0 : -EAGAIN;
 }
 
@@ -126,7 +126,7 @@ bool kfd_dbg_ev_raise(uint64_t event_mask,
 	if (!(process && process->debug_trap_enabled))
 		return false;
 
-	mutex_lock(&process->event_mutex);
+	down_write(&process->event_mutex) /* V17.5-rc7 F-A+ */;
 
 	if (event_mask & KFD_EC_MASK_DEVICE) {
 		for (i = 0; i < process->n_pdds; i++) {
@@ -190,7 +190,7 @@ bool kfd_dbg_ev_raise(uint64_t event_mask,
 		is_subscribed = false;
 	}
 
-	mutex_unlock(&process->event_mutex);
+	up_write(&process->event_mutex) /* V17.5-rc7 F-A+ */;
 
 	return is_subscribed;
 }
@@ -939,7 +939,7 @@ int kfd_dbg_trap_query_exception_info(struct kfd_process *target,
 	if (!info || !info_size)
 		return -EINVAL;
 
-	mutex_lock(&target->event_mutex);
+	down_write(&target->event_mutex) /* V17.5-rc7 F-A+ */;
 
 	if (KFD_DBG_EC_TYPE_IS_QUEUE(exception_code)) {
 		/* Per queue exceptions */
@@ -1037,7 +1037,7 @@ int kfd_dbg_trap_query_exception_info(struct kfd_process *target,
 	if (clear_exception)
 		*exception_status_ptr &= ~KFD_EC_MASK(exception_code);
 out:
-	mutex_unlock(&target->event_mutex);
+	up_write(&target->event_mutex) /* V17.5-rc7 F-A+ */;
 	return r;
 }
 
@@ -1065,7 +1065,7 @@ int kfd_dbg_trap_device_snapshot(struct kfd_process *target,
 
 	memset(&device_info, 0, sizeof(device_info));
 
-	mutex_lock(&target->event_mutex);
+	down_write(&target->event_mutex) /* V17.5-rc7 F-A+ */;
 
 	/* Run over all pdd of the process */
 	for (i = 0; i < tmp_num_devices; i++) {
@@ -1110,7 +1110,7 @@ int kfd_dbg_trap_device_snapshot(struct kfd_process *target,
 		user_info += tmp_entry_size;
 	}
 
-	mutex_unlock(&target->event_mutex);
+	up_write(&target->event_mutex) /* V17.5-rc7 F-A+ */;
 
 	return r;
 }
@@ -1125,7 +1125,7 @@ void kfd_dbg_set_enabled_debug_exception_mask(struct kfd_process *target,
 	loff_t pos = 0;
 	int i;
 
-	mutex_lock(&target->event_mutex);
+	down_write(&target->event_mutex) /* V17.5-rc7 F-A+ */;
 
 	found_mask |= target->exception_status;
 
@@ -1148,7 +1148,7 @@ void kfd_dbg_set_enabled_debug_exception_mask(struct kfd_process *target,
 
 	target->exception_enable_mask = exception_set_mask;
 
-	mutex_unlock(&target->event_mutex);
+	up_write(&target->event_mutex) /* V17.5-rc7 F-A+ */;
 }
 
 void kfd_dbg_enable_ttmp_setup(struct kfd_process *p)
