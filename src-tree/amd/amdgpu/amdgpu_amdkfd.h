@@ -248,8 +248,20 @@ struct amdkfd_process_info {
 	/* List of userptr BOs that are valid or invalid */
 	struct list_head userptr_valid_list;
 	struct list_head userptr_inval_list;
-	/* Lock to protect kfd_bo_list */
-	struct mutex lock;
+	/* Lock to protect vm_list_head / kfd_bo_list / userptr_*_list +
+	 * the eviction_fence pointer. In V17.5-rc7 this was converted from
+	 * struct mutex to struct rw_semaphore (F-B scaffolding) so future
+	 * per-site audits can downgrade pure list-walk callers to
+	 * down_read while mutators stay on down_write. Initial conversion
+	 * is mechanical: every existing mutex_lock/unlock pair becomes
+	 * down_write/up_write so the behaviour is identical to a mutex
+	 * (single-writer, no reader concurrency yet).
+	 *
+	 * The F-B kill-switch bit (KFD_SHARD_F_B_PROCESS_INFO) is reserved
+	 * for future RO-downgrade gating; in this initial scaffold it is
+	 * a no-op.
+	 */
+	struct rw_semaphore lock;
 
 	/* Number of VMs */
 	unsigned int n_vms;

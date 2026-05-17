@@ -1354,21 +1354,21 @@ static void add_kgd_mem_to_kfd_bo_list(struct kgd_mem *mem,
 				struct amdkfd_process_info *process_info,
 				bool userptr)
 {
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 	if (userptr)
 		list_add_tail(&mem->validate_list,
 			      &process_info->userptr_valid_list);
 	else
 		list_add_tail(&mem->validate_list, &process_info->kfd_bo_list);
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 }
 
 static void remove_kgd_mem_from_kfd_bo_list(struct kgd_mem *mem,
 		struct amdkfd_process_info *process_info)
 {
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 	list_del(&mem->validate_list);
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 }
 
 /* Initializes user pages. It registers the MMU notifier and validates
@@ -1392,7 +1392,7 @@ static int init_user_pages(struct kgd_mem *mem, uint64_t user_addr,
 	struct hmm_range *range;
 	int ret = 0;
 
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 
 	ret = amdgpu_ttm_tt_set_userptr(&bo->tbo, user_addr, 0);
 	if (ret) {
@@ -1417,7 +1417,7 @@ static int init_user_pages(struct kgd_mem *mem, uint64_t user_addr,
 		mutex_lock(&process_info->notifier_lock);
 		mem->invalid++;
 		mutex_unlock(&process_info->notifier_lock);
-		mutex_unlock(&process_info->lock);
+		up_write(&process_info->lock);
 		return 0;
 	}
 
@@ -1479,7 +1479,7 @@ unregister_out:
 	if (ret)
 		amdgpu_hmm_unregister(bo);
 out:
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 	return ret;
 }
 
@@ -1754,7 +1754,11 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
 		if (!info)
 			return -ENOMEM;
 
-		mutex_init(&info->lock);
+		/* V17.5-rc7 F-B: rwsem replaces mutex; all sites currently use
+		 * down_write so behaviour is mutex-equivalent. Reserved for
+		 * future per-site RO downgrades.
+		 */
+		init_rwsem(&info->lock);
 		mutex_init(&info->notifier_lock);
 		INIT_LIST_HEAD(&info->vm_list_head);
 		INIT_LIST_HEAD(&info->kfd_bo_list);
@@ -1802,13 +1806,13 @@ static int init_kfd_vm(struct amdgpu_vm *vm, void **process_info,
 	amdgpu_bo_unreserve(vm->root.bo);
 
 	/* Update process info */
-	mutex_lock(&vm->process_info->lock);
+	down_write(&vm->process_info->lock);
 	list_add_tail(&vm->vm_list_node,
 			&(vm->process_info->vm_list_head));
 	vm->process_info->n_vms++;
 	if (ef)
 		*ef = dma_fence_get(&vm->process_info->eviction_fence->base);
-	mutex_unlock(&vm->process_info->lock);
+	up_write(&vm->process_info->lock);
 
 	return 0;
 
@@ -1823,7 +1827,7 @@ reserve_pd_fail:
 		*process_info = NULL;
 		put_pid(info->pid);
 create_evict_fence_fail:
-		mutex_destroy(&info->lock);
+		/* V17.5-rc7 F-B: info->lock is now rw_semaphore (no destroy) */
 		mutex_destroy(&info->notifier_lock);
 		kfree(info);
 	}
@@ -2326,10 +2330,10 @@ void amdgpu_amdkfd_gpuvm_destroy_cb(struct amdgpu_device *adev,
 		return;
 
 	/* Update process info */
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 	process_info->n_vms--;
 	list_del(&vm->vm_list_node);
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 
 	vm->process_info = NULL;
 
@@ -2342,7 +2346,7 @@ void amdgpu_amdkfd_gpuvm_destroy_cb(struct amdgpu_device *adev,
 		dma_fence_put(&process_info->eviction_fence->base);
 		cancel_delayed_work_sync(&process_info->restore_userptr_work);
 		put_pid(process_info->pid);
-		mutex_destroy(&process_info->lock);
+		/* V17.5-rc7 F-B: rwsem has no explicit destroy operation */
 		mutex_destroy(&process_info->notifier_lock);
 		kfree(process_info);
 	}
@@ -2363,9 +2367,9 @@ void amdgpu_amdkfd_block_mmu_notifications(void *p)
 {
 	struct amdkfd_process_info *pinfo = (struct amdkfd_process_info *)p;
 
-	mutex_lock(&pinfo->lock);
+	down_write(&pinfo->lock);
 	WRITE_ONCE(pinfo->block_mmu_notifications, true);
-	mutex_unlock(&pinfo->lock);
+	up_write(&pinfo->lock);
 }
 
 int amdgpu_amdkfd_criu_resume(void *p)
@@ -2373,7 +2377,7 @@ int amdgpu_amdkfd_criu_resume(void *p)
 	int ret = 0;
 	struct amdkfd_process_info *pinfo = (struct amdkfd_process_info *)p;
 
-	mutex_lock(&pinfo->lock);
+	down_write(&pinfo->lock);
 	pr_debug("scheduling work\n");
 	mutex_lock(&pinfo->notifier_lock);
 	pinfo->evicted_bos++;
@@ -2387,7 +2391,7 @@ int amdgpu_amdkfd_criu_resume(void *p)
 			   &pinfo->restore_userptr_work, 0);
 
 out_unlock:
-	mutex_unlock(&pinfo->lock);
+	up_write(&pinfo->lock);
 	return ret;
 }
 
@@ -2606,12 +2610,12 @@ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(
 		bo->allowed_domains = AMDGPU_GEM_DOMAIN_GTT;
 		bo->preferred_domains = AMDGPU_GEM_DOMAIN_GTT;
 	} else {
-		mutex_lock(&avm->process_info->lock);
+		down_write(&avm->process_info->lock);
 		if (avm->process_info->eviction_fence &&
 		    !dma_fence_is_signaled(&avm->process_info->eviction_fence->base))
 			ret = amdgpu_amdkfd_bo_validate_and_fence(bo, domain,
 				&avm->process_info->eviction_fence->base);
-		mutex_unlock(&avm->process_info->lock);
+		up_write(&avm->process_info->lock);
 		if (ret)
 			goto err_validate_bo;
 	}
@@ -2684,9 +2688,9 @@ int amdgpu_amdkfd_gpuvm_free_memory_of_gpu(
 	}
 
 	/* Make sure restore workers don't access the BO any more */
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 	list_del(&mem->validate_list);
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 
 	/* Cleanup user pages and MMU notifiers */
 	if (amdgpu_ttm_tt_get_usermm(mem->bo->tbo.ttm)) {
@@ -2846,7 +2850,7 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
 	 * don't map invalid userptr BOs, we rely on the next restore
 	 * worker to do the mapping
 	 */
-	mutex_lock(&mem->process_info->lock);
+	down_write(&mem->process_info->lock);
 
 	/* Lock notifier lock. If we find an invalid userptr BO, we can be
 	 * sure that the MMU notifier is no longer running
@@ -2924,7 +2928,7 @@ int amdgpu_amdkfd_gpuvm_map_memory_to_gpu(
 out_unreserve:
 	unreserve_bo_and_vms(&ctx, false, false);
 out:
-	mutex_unlock(&mem->process_info->lock);
+	up_write(&mem->process_info->lock);
 	mutex_unlock(&mem->lock);
 	return ret;
 }
@@ -3103,7 +3107,7 @@ int amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel(struct kgd_mem *mem,
 		return -EINVAL;
 	}
 
-	mutex_lock(&mem->process_info->lock);
+	down_write(&mem->process_info->lock);
 
 	ret = amdgpu_bo_reserve(bo, true);
 	if (ret) {
@@ -3131,7 +3135,7 @@ int amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel(struct kgd_mem *mem,
 
 	amdgpu_bo_unreserve(bo);
 
-	mutex_unlock(&mem->process_info->lock);
+	up_write(&mem->process_info->lock);
 	return 0;
 
 kmap_failed:
@@ -3139,7 +3143,7 @@ kmap_failed:
 pin_failed:
 	amdgpu_bo_unreserve(bo);
 bo_reserve_failed:
-	mutex_unlock(&mem->process_info->lock);
+	up_write(&mem->process_info->lock);
 
 	return ret;
 }
@@ -3415,12 +3419,12 @@ static int import_obj_create(struct amdgpu_device *adev,
 	amdgpu_sync_create(&(*mem)->sync);
 	(*mem)->is_imported = true;
 
-	mutex_lock(&avm->process_info->lock);
+	down_write(&avm->process_info->lock);
 	if (avm->process_info->eviction_fence &&
 	    !dma_fence_is_signaled(&avm->process_info->eviction_fence->base))
 		ret = amdgpu_amdkfd_bo_validate_and_fence(bo, (*mem)->domain,
 				&avm->process_info->eviction_fence->base);
-	mutex_unlock(&avm->process_info->lock);
+	up_write(&avm->process_info->lock);
 	if (ret)
 		goto err_remove_mem;
 
@@ -3954,7 +3958,7 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
 		return;
 	}
 
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 
 	if (update_invalid_user_pages(process_info, mm))
 		goto unlock_out;
@@ -3992,7 +3996,7 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
 unlock_notifier_out:
 	mutex_unlock(&process_info->notifier_lock);
 unlock_out:
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 
 	/* If validation failed, reschedule another attempt */
 	if (evicted_bos) {
@@ -4055,7 +4059,7 @@ int amdgpu_amdkfd_gpuvm_restore_process_bos(void *info, struct dma_fence __rcu *
 
 	INIT_LIST_HEAD(&duplicate_save);
 
-	mutex_lock(&process_info->lock);
+	down_write(&process_info->lock);
 
 	drm_exec_init(&exec, DRM_EXEC_IGNORE_DUPLICATES, 0);
 	drm_exec_until_all_locked(&exec) {
@@ -4235,7 +4239,7 @@ validate_map_fail:
 	amdgpu_sync_free(&sync_obj);
 ttm_reserve_fail:
 	drm_exec_fini(&exec);
-	mutex_unlock(&process_info->lock);
+	up_write(&process_info->lock);
 	return ret;
 }
 
@@ -4262,7 +4266,7 @@ int amdgpu_amdkfd_add_gws_to_process(void *info, void *gws, struct kgd_mem **mem
 
 
 	/* Validate gws bo the first time it is added to process */
-	mutex_lock(&(*mem)->process_info->lock);
+	down_write(&(*mem)->process_info->lock);
 	ret = amdgpu_bo_reserve(gws_bo, false);
 	if (unlikely(ret)) {
 		pr_err("Reserve gws bo failed %d\n", ret);
@@ -4285,7 +4289,7 @@ int amdgpu_amdkfd_add_gws_to_process(void *info, void *gws, struct kgd_mem **mem
 			   &process_info->eviction_fence->base,
 			   DMA_RESV_USAGE_BOOKKEEP);
 	amdgpu_bo_unreserve(gws_bo);
-	mutex_unlock(&(*mem)->process_info->lock);
+	up_write(&(*mem)->process_info->lock);
 
 	return ret;
 
@@ -4293,7 +4297,7 @@ reserve_shared_fail:
 bo_validation_failure:
 	amdgpu_bo_unreserve(gws_bo);
 bo_reservation_failure:
-	mutex_unlock(&(*mem)->process_info->lock);
+	up_write(&(*mem)->process_info->lock);
 	amdgpu_sync_free(&(*mem)->sync);
 	remove_kgd_mem_from_kfd_bo_list(*mem, process_info);
 	amdgpu_bo_unref(&gws_bo);
