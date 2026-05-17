@@ -882,6 +882,29 @@ struct kfd_process_device {
 	/* The device that owns this data. */
 	struct kfd_node *dev;
 
+	/* V17.5-rc7 F-A: per-pdd event-wait mutex (placeholder).
+	 *
+	 * Currently the per-process kfd_process->event_mutex protects
+	 * event_idr, signal_page, signal_event_count and the
+	 * kfd_wait_on_events critical sections.  Within a single process
+	 * spanning multiple GPUs (vLLM TP4) this serialises every GPU's
+	 * event operations onto one mutex.
+	 *
+	 * NVIDIA's per-FD nv_linux_file_private_t gives each GPU its own
+	 * event/signal state automatically; AMD's per-process kfd_process
+	 * cannot do that without changing IPC semantics (signal_page is
+	 * per-process by design).
+	 *
+	 * This field is the staging point for future per-GPU event-state
+	 * migration.  In this initial F-A scaffold patch it is initialised
+	 * but NOT yet used as the active lock for any site -- the
+	 * KFD_SHARD_F_A_EVENT_MUTEX kill-switch bit is reserved.
+	 *
+	 * A follow-up patch may migrate selected fast-path sites (e.g. the
+	 * kfd_wait_on_events init-waiter section when all targeted events
+	 * resolve to the same pdd) to take pdd->event_wait_mutex instead.
+	 */
+	struct mutex event_wait_mutex;
 
 
 	/* The process that owns this kfd_process_device. */

@@ -1148,6 +1148,8 @@ static void kfd_process_destroy_pdds(struct kfd_process *p)
 
 		idr_destroy(&pdd->alloc_idr);
 		mutex_destroy(&pdd->qpd.doorbell_lock);
+		/* V17.5-rc7 F-A: per-pdd event-wait mutex */
+		mutex_destroy(&pdd->event_wait_mutex);
 
 		kfd_free_process_doorbells(pdd->dev->kfd, pdd);
 
@@ -1860,6 +1862,12 @@ struct kfd_process_device *kfd_create_process_device_data(struct kfd_node *dev,
 		return NULL;
 
 	pdd->dev = dev;
+	/* V17.5-rc7 F-A: per-pdd event-wait mutex. Currently a placeholder
+	 * (no site takes it yet); reserved for future per-site migration
+	 * of fast paths from kfd_process->event_mutex. See struct definition
+	 * for full rationale.
+	 */
+	mutex_init(&pdd->event_wait_mutex);
 	INIT_LIST_HEAD(&pdd->qpd.queues_list);
 	INIT_LIST_HEAD(&pdd->qpd.priv_queue_list);
 	pdd->qpd.dqm = dev->dqm;
